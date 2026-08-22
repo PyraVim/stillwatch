@@ -1,0 +1,37 @@
+[package]
+name = "stillwatch"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+license = "MIT"
+description = "A watchdog for processes that run unattended."
+repository = "https://github.com/cfletcher/stillwatch"
+readme = "README.md"
+
+# Versions are pinned exactly. A watchdog that silently changes behaviour on
+# `cargo update` is not a watchdog.
+[dependencies]
+async-trait = "=0.1.92"
+axum = "=0.8.9"
+chrono = "=0.4.45"
+clap = { version = "=4.6.6", features = ["derive"] }
+humantime-serde = "=1.1.1"
+reqwest = { version = "=0.13.4", features = ["json"] }
+serde = { version = "=1.0.229", features = ["derive"] }
+serde_json = "=1.0.151"
+thiserror = "=2.0.20"
+tokio = { version = "=1.53.1", features = [
+    "macros",
+    "net",
+    "rt-multi-thread",
+    "signal",
+    "sync",
+    "time",
+] }
+toml = "=1.1.4"
+tracing = "=0.1.44"
+tracing-subscriber = { version = "=0.3.23", features = ["env-filter"] }
+
+[dev-dependencies]
+http-body-util = "=0.1.5"
+tower = { version = "=0.5.3", features = ["util"] }
