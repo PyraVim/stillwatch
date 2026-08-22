@@ -1,0 +1,10 @@
+/target
+**/*.rs.bk
+
+# real config may hold secrets; only the example is tracked
+/stillwatch.toml
+*.env
+.env
+
+# incident log
+*.jsonl
