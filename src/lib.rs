@@ -5,4 +5,5 @@
 
 pub mod config;
 pub mod fmt;
+pub mod receiver;
 pub mod state;
