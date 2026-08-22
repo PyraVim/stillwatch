@@ -4,6 +4,7 @@
 //! tests in `tests/` can drive the same code the binary runs.
 
 pub mod config;
+pub mod evaluate;
 pub mod fmt;
 pub mod receiver;
 pub mod state;
