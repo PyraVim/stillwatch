@@ -92,10 +92,69 @@ name = "nightly-sync"
 
 
 # ---------------------------------------------------------------------------
+# A dependency, probed directly
+# ---------------------------------------------------------------------------
+#
+# Checks are polled by stillwatch rather than reporting in. Latency goes into a
+# rolling window and is judged against the dependency's *own* recent normal — a
+# dependency that has always taken 400ms is fine; one that took 90ms an hour ago
+# is not.
+
+[[check]]
+name     = "vendor-api"
+type     = "http"                            # or "jsonrpc", which also needs `method`
+url      = "https://api.vendor.com/health"
+interval = "30s"
+timeout  = "3s"                              # must be shorter than interval
+
+# How long every probe must have been failing before the check is called down.
+# Defaults to two intervals, so one blip is not a page. This is a duration the
+# failures must actually last, not just a window they happen to be alone in.
+down_after = "60s"
+
+  [check.degradation]
+  # Latency is compared at p90. "Current" is the last twenty probes; the
+  # baseline is the window before that, deliberately excluding the recent
+  # stretch so a slowdown still in progress cannot teach the baseline that it
+  # is normal.
+  baseline_window   = "1h"
+  warn_multiple     = 3.0                    # p90 three times its own recent normal
+  critical_multiple = 8.0
+
+  # Latency that is unacceptable no matter what the baseline has learned.
+  #
+  # Read this one carefully, because it is doing more work than it looks like.
+  # If stillwatch starts while this dependency is already slow, the baseline
+  # learns that slow is normal and the multiples will never fire again. The
+  # ceiling is evaluated independently of the baseline — and before any baseline
+  # exists at all — so it is the only thing that catches that case. Set it to
+  # what you actually consider unacceptable, not to some extreme: a baseline
+  # poisoned to a value *below* the ceiling is still invisible.
+  #
+  # stillwatch also alerts if the baseline itself ends up at or above this
+  # value, because that means the check has stopped protecting you.
+  absolute_ceiling  = "2s"
+
+  # Probes needed before the baseline is trusted. Until then the check reports
+  # "warming up" rather than "ok" — not being judged yet is not the same as
+  # being healthy — and only the ceiling applies. Startup logs say how long the
+  # wait will be. A baseline_window too short to ever hold this many probes at
+  # this interval is rejected at startup rather than warming up forever.
+  min_samples       = 30
+
+# A check with no [check.degradation] block is watched for up/down only and is
+# never judged on latency, however slow it gets.
+#
+# [[check]]
+# name = "queue-broker"
+# url  = "https://broker.internal/ping"
+
+
+# ---------------------------------------------------------------------------
 # Not yet implemented
 # ---------------------------------------------------------------------------
 #
-# This version evaluates the `alive` signal only. Config for anything else —
-# [job.worked], [job.freshness], [[job.ratio]], [[check]] — parses without
+# This version evaluates the `alive` signal and dependency checks. Config for
+# anything else — [job.worked], [job.freshness], [[job.ratio]] — parses without
 # error but is not acted on, and stillwatch logs a warning at startup naming
 # each key it is ignoring, so a line that does nothing never does so quietly.

@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::error::Error;
 use std::io;
 use std::net::SocketAddr;
@@ -8,10 +9,10 @@ use std::time::{Duration, SystemTime};
 
 use clap::Parser;
 use stillwatch::config::{self, Config, ConfigError, SystemEnv};
-use stillwatch::evaluate::evaluate;
+use stillwatch::evaluate::{check_health, evaluate, CheckHealth};
 use stillwatch::notify::{Dispatcher, LogOnly, Notifier, Telegram};
 use stillwatch::state::{SharedState, State};
-use stillwatch::{fmt, receiver};
+use stillwatch::{fmt, prober, receiver};
 use tokio::time::MissedTickBehavior;
 use tracing_subscriber::EnvFilter;
 
@@ -44,6 +45,9 @@ enum StartupError {
         #[source]
         source: io::Error,
     },
+
+    #[error("could not build the http client used to probe dependencies")]
+    Client(#[source] reqwest::Error),
 
     #[error("the receiver stopped unexpectedly")]
     Serve(#[source] io::Error),
@@ -88,6 +92,22 @@ async fn run(cli: Cli) -> Result<(), StartupError> {
 
     tracing::info!(listen = %config.listen, "receiver ready");
 
+    // One shared client so connection pooling is real: a fresh client per probe
+    // would measure TLS handshakes rather than the dependency.
+    let client = reqwest::Client::builder()
+        .user_agent(concat!("stillwatch/", env!("CARGO_PKG_VERSION")))
+        .build()
+        .map_err(StartupError::Client)?;
+
+    let mut probers = Vec::with_capacity(config.checks.len());
+    for check in config.checks {
+        probers.push(tokio::spawn(prober::run(
+            check,
+            client.clone(),
+            state.clone(),
+        )));
+    }
+
     let evaluator = tokio::spawn(watch(state.clone(), Dispatcher::new(notifier)));
 
     let served = axum::serve(listener, receiver::router(state))
@@ -95,6 +115,9 @@ async fn run(cli: Cli) -> Result<(), StartupError> {
         .await;
 
     evaluator.abort();
+    for prober in probers {
+        prober.abort();
+    }
     served.map_err(StartupError::Serve)
 }
 
@@ -110,14 +133,59 @@ async fn watch(state: SharedState, mut dispatcher: Dispatcher) {
     // burst of identical evaluations. One late tick is enough.
     ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
 
+    let mut reported: BTreeMap<String, CheckHealth> = BTreeMap::new();
+
     loop {
         ticker.tick().await;
         let now = SystemTime::now();
 
         // The lock is released before any awaiting happens.
-        let assessments = state.read(|state| evaluate(state, now));
+        let (assessments, health) =
+            state.read(|state| (evaluate(state, now), check_health(state, now)));
 
+        report_check_health(&mut reported, health);
         dispatcher.dispatch(&assessments, now).await;
+    }
+}
+
+/// Logs each check's verdict basis whenever it changes.
+///
+/// Not every one of these is an alert, and most should not be: a check that is
+/// still warming up is not an incident. But whether a check is *being judged* is
+/// something a reader has to be able to find out, so every transition is stated
+/// once rather than left to be inferred from silence.
+fn report_check_health(
+    reported: &mut BTreeMap<String, CheckHealth>,
+    current: Vec<(String, CheckHealth)>,
+) {
+    for (name, health) in current {
+        if reported.get(&name) == Some(&health) {
+            continue;
+        }
+
+        match &health {
+            CheckHealth::Warming { samples, needed } => tracing::info!(
+                check = %name,
+                samples,
+                needed,
+                "warming up; judged against the ceiling only until the baseline fills"
+            ),
+            CheckHealth::Ok => tracing::info!(check = %name, "ok"),
+            CheckHealth::OkWithStaleBaseline {
+                baseline_p90,
+                recent_p90,
+            } => tracing::warn!(
+                check = %name,
+                baseline = %fmt::latency(*baseline_p90),
+                current = %fmt::latency(*recent_p90),
+                "responding well, but its baseline was learned during a slower stretch \
+                 and will not fire until the window rolls over"
+            ),
+            CheckHealth::Degraded => tracing::warn!(check = %name, "degraded"),
+            CheckHealth::Down => tracing::error!(check = %name, "down"),
+        }
+
+        reported.insert(name, health);
     }
 }
 
@@ -128,8 +196,8 @@ fn describe(config: &Config) {
         tracing::warn!("no notifier configured; alerts will only be logged");
     }
 
-    if config.jobs.is_empty() {
-        tracing::warn!("no jobs configured; nothing is being watched");
+    if config.jobs.is_empty() && config.checks.is_empty() {
+        tracing::warn!("no jobs and no checks configured; nothing is being watched");
     }
 
     for job in &config.jobs {
@@ -144,6 +212,35 @@ fn describe(config: &Config) {
             None => tracing::info!(
                 job = %job.name,
                 "no [job.alive] block; not watching for missed beats"
+            ),
+        }
+    }
+
+    for check in &config.checks {
+        tracing::info!(
+            check = %check.name,
+            kind = check.probe.kind(),
+            url = %check.probe.url(),
+            interval = %fmt::duration(check.interval),
+            down_after = %fmt::duration(check.down_after),
+            "probing"
+        );
+
+        match &check.degradation {
+            // Says up front how long this check will go before it can judge
+            // anything on latency, so nobody has to guess whether silence means
+            // healthy or means not-yet-watching.
+            Some(degradation) => tracing::info!(
+                check = %check.name,
+                ceiling = %fmt::latency(degradation.absolute_ceiling),
+                warn_multiple = degradation.warn_multiple,
+                critical_multiple = degradation.critical_multiple,
+                baseline_after = %fmt::duration(check.interval * degradation.min_samples as u32),
+                "the ceiling applies immediately; the multiples wait for a baseline"
+            ),
+            None => tracing::info!(
+                check = %check.name,
+                "no [check.degradation] block; watching up/down only, never latency"
             ),
         }
     }

@@ -274,18 +274,25 @@ fn assess_check(check: &CheckState, now: SystemTime) -> (CheckHealth, Option<Ass
             .and_then(|start| now.duration_since(start).ok())
             .unwrap_or_default();
 
-        return (
-            CheckHealth::Down,
-            Some(Assessment {
-                subject,
-                severity: Severity::Critical,
-                reason: Reason::CheckDown {
-                    failing_for,
-                    failed_probes: run.count,
-                    last_error: run.last_error,
-                },
-            }),
-        );
+        // The failures have to have *lasted* `down_after`, not merely be the
+        // only thing inside a window that long. Without this, a check whose very
+        // first probe fails is called down immediately — the same mistake as
+        // treating a job with no heartbeat history as dead, and it makes
+        // `down_after` mean nothing on a cold start.
+        if failing_for >= config.down_after {
+            return (
+                CheckHealth::Down,
+                Some(Assessment {
+                    subject,
+                    severity: Severity::Critical,
+                    reason: Reason::CheckDown {
+                        failing_for,
+                        failed_probes: run.count,
+                        last_error: run.last_error,
+                    },
+                }),
+            );
+        }
     }
 
     // A check with no `[check.degradation]` block asked to be watched for
@@ -1103,6 +1110,45 @@ mod tests {
             evaluate(&state, at(STARTED + 630)).is_empty(),
             "one blip must not page"
         );
+    }
+
+    /// Regression, found by running it: a check whose very first probe fails was
+    /// called down on the spot, because one failure was the only thing inside a
+    /// `down_after`-long window and therefore trivially "all" of it. The
+    /// failures have to have lasted `down_after`, not just be alone in it.
+    #[test]
+    fn a_check_that_fails_its_very_first_probe_is_not_instantly_down() {
+        let mut state = with_checks(&[ping_only()]);
+        probe_failing(
+            &mut state,
+            "queue-broker",
+            STARTED,
+            STARTED,
+            "connection refused",
+        );
+
+        assert!(
+            evaluate(&state, at(STARTED)).is_empty(),
+            "down_after must still be honoured on a cold start"
+        );
+        assert!(evaluate(&state, at(STARTED + 30)).is_empty());
+    }
+
+    #[test]
+    fn a_cold_start_against_a_dead_dependency_is_reported_once_down_after_passes() {
+        let mut state = with_checks(&[ping_only()]);
+        probe_failing(
+            &mut state,
+            "queue-broker",
+            STARTED,
+            STARTED + 90,
+            "connection refused",
+        );
+
+        // `down_after` is 60s and the failures now span 90s.
+        let assessments = evaluate(&state, at(STARTED + 90));
+        assert_eq!(assessments.len(), 1);
+        assert_eq!(assessments[0].severity, Severity::Critical);
     }
 
     #[test]
