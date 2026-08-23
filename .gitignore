@@ -1,10 +1,17 @@
 /target
 **/*.rs.bk
 
-# real config may hold secrets; only the example is tracked
-/stillwatch.toml
-*.env
-.env
+# A real config holds a live bot token. Unanchored so it is ignored at any
+# depth — deploy/stillwatch.toml is exactly as sensitive as ./stillwatch.toml.
+# This does not match stillwatch.toml.example, which is meant to be tracked.
+stillwatch.toml
 
-# incident log
+# environment and credentials
+*.env
+.envrc
+*.pem
+*.key
+
+# incident log and runtime output
 *.jsonl
+*.log

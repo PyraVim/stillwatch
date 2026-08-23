@@ -3,17 +3,29 @@
 **A watchdog for things that run without you.**
 
 Not "is the process up." That's the least interesting failure, and it's the one
-you'd notice anyway. The expensive failures are the ones where it's up and wrong:
+you'd notice anyway. `stillwatch` watches the *loop*, from inside it: a scraper
+whose worker thread died at 3am is still a running process, still answering its
+health check, still using memory. It just stopped beating.
 
-* the scraper that's been returning zero rows since Tuesday
-* the sync job authenticating fine against a token that quietly stopped granting access
-* the aggregator that lost one of its seven sources and just started publishing thinner data
-* the trading bot submitting orders that never fill
-* the nightly ETL that ran, exited zero, and wrote nothing
+---
 
-Every one of those passes a health check.
+## What it does today
 
-\---
+One HTTP endpoint. Your job posts to it each time round its loop:
+
+```bash
+curl -fsS -X POST localhost:9111/beat/nightly-sync
+```
+
+If the beats stop for longer than you said they should, you get a message that
+tells you what happened, what *isn't* wrong, and what it probably means. If they
+start again, you get an all-clear with the duration. One message per incident,
+not one per check cycle.
+
+That's the whole of version 0.1. The rest of the plan is in [Roadmap](#roadmap),
+and none of it is built yet.
+
+---
 
 ## Why this exists
 
@@ -23,27 +35,24 @@ an audit trail, because running unattended without those was unthinkable. If a
 system ran wrong for six hours, you didn't just fix it — you wrote up why nobody
 knew for six hours, and that document had to survive an audit.
 
-Then I started building automation outside that world and found almost none of that
-exists. People write the thing that does the work and hope. Where there is
+Then I started building automation outside that world and found almost none of
+that exists. People write the thing that does the work and hope. Where there is
 monitoring, it answers "is the process alive," which is the single failure mode
 that doesn't need monitoring to detect.
 
-`stillwatch` is the part nobody builds for themselves.
+The failures worth catching are the ones where the job is up and wrong:
 
-\---
-
-## What it catches
-
-|Failure|Why ordinary monitoring misses it|
+| Failure | Why ordinary monitoring misses it |
 |-|-|
-|**Alive but idle-dead**|Process up, loop spinning, stopped doing anything. Looks perfectly healthy.|
-|**Acting on stale data**|The feed froze. Everything downstream keeps working confidently on numbers from nine minutes ago.|
-|**Working but not landing**|Every attempt fails. Process healthy, dependencies healthy, output zero.|
-|**Degraded, not down**|An API that answered in 90ms now takes 1.4s. Still 200 OK. Every check passes. Everything gets slower and nobody is told.|
+| **Alive but idle-dead** | Process up, loop spinning, stopped doing anything. Looks perfectly healthy. |
+| **Acting on stale data** | The feed froze. Everything downstream keeps working confidently on numbers from nine minutes ago. |
+| **Working but not landing** | Every attempt fails. Process healthy, dependencies healthy, output zero. |
+| **Degraded, not down** | An API that answered in 90ms now takes 1.4s. Still 200 OK. Every check passes. Everything gets slower and nobody is told. |
 
-That last one is the one that costs the most and gets monitored the least.
+Version 0.1 catches the case where the loop stops entirely. The other three are
+what the roadmap is for, and they're the reason this is being built at all.
 
-\---
+---
 
 ## Alive is not the same as working
 
@@ -58,11 +67,14 @@ So heartbeats carry two separate signals:
 
 * **`alive`** — my loop ran. Expected on a tight interval. Missing means dead.
 * **`worked`** — I actually did something. Expected irregularly. A long silence
-means *look into it*, not *wake someone up*.
+  means *look into it*, not *wake someone up*.
 
-Different thresholds, different severities.
+Today `stillwatch` evaluates `alive`. What matters is that it already refuses to
+confuse the two: a job that declares no `[job.alive]` block is **never** judged
+late, however long it stays quiet. A nightly sync does not inherit a scraper's
+cadence, and there is a test with that name on it.
 
-\---
+---
 
 ## Quick start
 
@@ -76,12 +88,13 @@ Then, from your job — any language, no client library, no dependency:
 curl -fsS -X POST localhost:9111/beat/nightly-sync
 ```
 
-That's a valid heartbeat. Everything beyond it is optional:
+That's a valid heartbeat. A bare POST with no body and no `content-type` is the
+whole protocol. Everything beyond it is optional:
 
 ```bash
-curl -fsS -X POST localhost:9111/beat/nightly-sync \\
-  -H 'content-type: application/json' \\
-  -d '{"worked":true,"data\_ts":1724500000,"counters":{"rows\_read":8400,"rows\_written":8400}}'
+curl -fsS -X POST localhost:9111/beat/nightly-sync \
+  -H 'content-type: application/json' \
+  -d '{"worked":true,"data_ts":1724500000,"counters":{"rows_read":8400,"rows_written":8400}}'
 ```
 
 ```python
@@ -90,122 +103,94 @@ requests.post("http://localhost:9111/beat/scraper",
               json={"worked": True, "counters": {"fetched": 120, "parsed": 118}})
 ```
 
-\---
+`worked`, `data_ts` and `counters` are accepted and logged today. Nothing
+evaluates them yet — they're part of the wire protocol so that jobs can start
+sending them now and not need changing later.
+
+Two responses that aren't `200`:
+
+* **`404`** — no job by that name is configured. A typo in the URL must not
+  leave the real job silently unwatched, so it's refused and logged rather than
+  quietly accepted.
+* **`400`** — there was a body and it wasn't valid JSON. It does not count as a
+  heartbeat.
+
+---
 
 ## Configure
 
 ```toml
 listen = "127.0.0.1:9111"
 
-\[notify.telegram]
-token   = "${TELEGRAM\_TOKEN}"
-chat\_id = "${TELEGRAM\_CHAT}"
+[notify.telegram]
+token   = "${TELEGRAM_TOKEN}"
+chat_id = "${TELEGRAM_CHAT}"
 
 # --- a scraper that should run continuously ---
-\[\[job]]
+[[job]]
 name = "product-scraper"
 
-  \[job.alive]
-  expect\_every   = "60s"
-  warn\_after     = "5m"
-  critical\_after = "15m"
-
-  \[\[job.ratio]]
-  name        = "parse rate"
-  numerator   = "parsed"
-  denominator = "fetched"
-  window      = "1h"
-  min         = 0.9
-  min\_sample  = 50
-  message     = "pages fetching but not parsing — the site's markup probably changed"
+  [job.alive]
+  expect_every   = "60s"     # how often the loop says it ran
+  warn_after     = "5m"      # optional, defaults to 5x expect_every
+  critical_after = "15m"     # optional, defaults to 15x expect_every
 
 # --- a nightly job that should be quiet most of the day ---
-\[\[job]]
+# No [job.alive] block, so it is never judged late.
+[[job]]
 name = "nightly-sync"
-
-  \[job.worked]
-  warn\_after     = "26h"      # missed one night
-  critical\_after = "50h"      # missed two
-
-  \[job.freshness]
-  warn\_after     = "26h"
-
-# --- a dependency, watched directly ---
-\[\[check]]
-name     = "vendor-api"
-type     = "http"
-url      = "https://api.vendor.com/health"
-interval = "30s"
-timeout  = "3s"
-
-  \[check.degradation]
-  baseline\_window   = "1h"
-  warn\_multiple     = 3.0     # p90 three times its own recent normal
-  critical\_multiple = 8.0
-  absolute\_ceiling  = "2s"
 ```
 
-`${VAR}` interpolation everywhere, so no secret is ever in the file.
+A minimal working config is four lines — everything but job names has a default.
+`listen` defaults to `127.0.0.1:9111`, and both thresholds derive from
+`expect_every` if you leave them out.
 
-\---
+`warn_after` must be longer than `expect_every`, or it would fire in the ordinary
+gap between two beats. That's checked at startup, not discovered at 3am.
 
-## Don't guess your thresholds
+**Secrets.** `${VAR}` is expanded from the environment in any value, so no secret
+has to sit on disk. An unset variable is a startup error naming the variable —
+never an empty string that fails quietly later. Interpolation happens over the
+parsed TOML, not the raw text, so a secret containing a quote can't rewrite the
+file around it.
 
-A watchdog with wrong thresholds is worse than none. It either pages you constantly
-until you mute it, or it never fires at all. Nobody knows their job's real cadence
-off the top of their head.
+**Containers.** Three values can also be set directly, for deploys with no
+writable config:
 
-```bash
-stillwatch learn --job product-scraper --for 6h
+```
+STILLWATCH_LISTEN
+STILLWATCH_NOTIFY_TELEGRAM_TOKEN
+STILLWATCH_NOTIFY_TELEGRAM_CHAT_ID
 ```
 
-Observe-only. Records what actually happens — beat intervals, gaps between real
-work, dependency latency distributions, counter ratios — then prints a config block
-with the evidence behind every number:
+Uppercase the dotted path, replace `.` with `_`. These win over both the file and
+any `${VAR}` in it. Per-job values are deliberately *not* overridable this way:
+array entries have no stable key to name them by, and inventing an indexing
+scheme would be a second config language.
 
-```toml
-# learned from 6h0m, 358 beats
-\[\[job]]
-name = "product-scraper"
+`$STILLWATCH_CONFIG` sets the config path; it falls back to `./stillwatch.toml`.
 
-  \[job.alive]
-  expect\_every   = "60s"    # observed p50 60.2s, p99 63s, worst gap 71s
-  warn\_after     = "5m"     # 4x the worst gap seen
-  critical\_after = "15m"
+Config for features that aren't built yet parses without error and logs a warning
+naming every key it ignored. A line that does nothing should never do so quietly.
 
-# vendor-api: p50 88ms, p90 140ms, p99 410ms over 719 samples
-```
+See [`stillwatch.toml.example`](stillwatch.toml.example) for the annotated version.
 
-Never tighter than the worst thing observed. Always with the evidence attached, so
-you can argue with it.
-
-And before you trust it with your phone:
-
-```bash
-stillwatch --dry-run     # evaluates and logs what it would have sent. sends nothing.
-```
-
-\---
+---
 
 ## What the alerts look like
 
 ```
 ⚠️  product-scraper — no heartbeat for 5m12s
-    last beat 14:32:07, expected every 60s
-    vendor-api OK
-    → the scraper is down, not its dependency
+    last beat 14:32:07 -04:00, expected every 1m
+    stillwatch has been up for the whole gap — this is the job, not the watchdog
+    → the loop has stopped; the process has most likely exited or wedged
 
-🔴  vendor-api — degraded
-    p90 1.4s, baseline 140ms over the last hour
-    still responding · 0 errors · every health check passing
-    → everything downstream is now three times slower and nothing said so
+🔴  clients-etl — no heartbeat since stillwatch started, 15m3s ago
+    watching since 09:14:02 -04:00, expected every 1m; nothing has ever arrived
+    → either the job was already stopped when the watch began, or it has never
+      been wired up to send beats
 
-⚠️  product-scraper — parse rate 41% (was 99%)
-    last hour: 1,204 fetched, 494 parsed
-    alive ✓ · vendor-api healthy ✓
-    → fetching fine, parsing broken. the markup probably changed.
-
-✅  vendor-api recovered — degraded for 18m4s
+✅  product-scraper recovered — no heartbeat for 20m5s
 ```
 
 Three rules, and they're deliberate:
@@ -214,7 +199,10 @@ Three rules, and they're deliberate:
 2. **Say what isn't wrong.** Ruling things out is half the value of being woken up.
 3. **End with the implication in plain language.** Never send a bare "check failed."
 
-\---
+Configure no notifier at all and it still runs, says so at startup, and writes
+the same alerts to the log instead of delivering them.
+
+---
 
 ## Alert fatigue is the real failure mode
 
@@ -222,61 +210,76 @@ A monitoring tool that cries wolf gets muted, and a muted tool is worse than no
 tool because you think you're covered.
 
 * **Deduplicated** — one alert per incident, not one per evaluation cycle
-* **Escalating** — warn, then critical. Then nothing. It doesn't nag.
-* **Recovering** — every alert gets an all-clear with the duration. An alert with
-no resolution teaches people to ignore alerts.
-* **Flap-damped** — a condition has to hold through a confirmation window. Something
-that fixes itself in four seconds is not an incident.
-* **Fails loudly** — if the notifier is unreachable, alerts queue and retry. Nothing
-is dropped silently.
+* **Escalating** — warn, then critical. Then nothing. It doesn't nag, and it
+  doesn't walk back down either.
+* **Recovering** — every alert gets an all-clear with the duration of the whole
+  incident, measured from the first warning rather than the escalation. An alert
+  with no resolution teaches people to ignore alerts.
+* **Fails loudly** — if the notifier is unreachable, alerts queue in order and
+  retry with backoff. Nothing is dropped silently. A message the notifier will
+  refuse identically forever — a wrong chat id, say — is dropped rather than
+  allowed to block every alert behind it, and it's logged as an error telling
+  you to fix the config.
 
-\---
+---
 
 ## It doesn't lie about itself
 
 * **A restart is not an outage.** No history means unknown, not down. It waits a
-full interval before judging anything.
-* **It reports its own gaps.** If `stillwatch` was down for twenty minutes, the
-report says so rather than showing 100% uptime for a window it wasn't watching.
-* **One process, no clustering.** If you want the watchdog watched, run a second one
-pointed at the first. That's the whole answer.
+  full threshold before judging anything.
+* **But a job that was already dead is still reported.** With no beats ever seen,
+  silence is measured from when `stillwatch` started — and the alert says exactly
+  that rather than inventing a last-beat time it never observed. A job that died
+  before the watchdog started is the failure a watchdog most needs to catch.
+* **One process, no clustering.** If you want the watchdog watched, run a second
+  one pointed at the first. That's the whole answer.
 
-\---
+---
 
-## Incidents
+## Install
 
-Everything appends to a JSONL log. No database.
+No published crate yet. Build it:
 
 ```bash
-stillwatch report --since 7d
+git clone https://github.com/YOUR-USERNAME/stillwatch
+cd stillwatch
+cargo build --release
+./target/release/stillwatch --config stillwatch.toml
 ```
 
-```
-product-scraper   uptime 99.2%   3 incidents   longest 18m4s
-nightly-sync      uptime  100%   0 incidents
-vendor-api        uptime 97.8%   1 degradation 41m
-```
+Single static binary, no runtime dependencies, no database.
 
-\---
+---
+
+## Roadmap
+
+None of this is built. It's here so you can see where it's going and decide
+whether today's version is worth adopting anyway.
+
+| | |
+|-|-|
+| **Dependency probes** | Poll an HTTP or JSON-RPC dependency on its own interval, with latency percentiles and degradation measured against its *own* recent baseline — never a fixed number. A dependency that has always taken 400ms is fine; one that took 90ms an hour ago is not. |
+| **Freshness, `worked`, counter ratios** | Evaluate the other half of the heartbeat: how stale the data is, whether real work is happening, and generic named-counter rules (`parsed / fetched`, `rows_written / rows_read`, `landed / submitted` — same machinery, no domain knowledge). |
+| **`learn` mode** | `stillwatch learn --job x --for 6h` observes without alerting, then emits a config block with the evidence behind every number. Nobody knows their job's real cadence, and a watchdog with wrong thresholds either pages constantly until muted or never fires. |
+| **`--dry-run`** | Evaluate live and log what it *would* have sent. People need to watch it be right for a day before trusting it with their phone. |
+| **Passive mode** | Watch something you can't modify: a pidfile, a log that should still be moving, an output file that should still be appearing. Weaker signals than a heartbeat, and the docs will say so — but "I can watch this today without touching your code" is what makes it usable on day one. |
+| **Flap damping** | Require a condition to hold through a confirmation window. Something that fixes itself in four seconds is not an incident. |
+| **Incident log and `report`** | Append every incident to JSONL; `stillwatch report --since 7d` prints per-subject uptime, incident count and longest outage — including gaps when `stillwatch` itself wasn't watching, rather than claiming 100% for a window it missed. |
+| **Deploy** | Dockerfile and a systemd unit. |
+
+---
 
 ## What it isn't
+
+Not "not yet" — not ever:
 
 No dashboard. No metrics backend. No Prometheus exporter. No clustering. No
 knowledge of what your job actually does.
 
 It watches, it decides, and it tells you. Everything else is somebody else's tool.
 
-\---
-
-## Install
-
-```bash
-cargo install stillwatch
-```
-
-Single static binary. `Dockerfile` and a systemd unit are in `deploy/`.
+---
 
 ## License
 
 MIT
-
