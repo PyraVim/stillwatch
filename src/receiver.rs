@@ -126,7 +126,7 @@ mod tests {
                 alive: None,
             },
         ];
-        SharedState::new(JobStates::new(SystemTime::now(), &jobs))
+        SharedState::new(JobStates::new(SystemTime::now(), &jobs, &[]))
     }
 
     async fn post_beat(state: &SharedState, job: &str, body: Option<&str>) -> (StatusCode, String) {

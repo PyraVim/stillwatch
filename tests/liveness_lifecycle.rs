@@ -95,7 +95,7 @@ async fn run_until(state: &SharedState, dispatcher: &mut Dispatcher, from: u64, 
 #[tokio::test]
 async fn a_scraper_dies_is_reported_and_recovers_while_a_nightly_job_stays_quiet() {
     let config = load();
-    let state = SharedState::new(State::new(at(START), &config.jobs));
+    let state = SharedState::new(State::new(at(START), &config.jobs, &config.checks));
     let recorder = Arc::new(Recorder::default());
     let mut dispatcher = Dispatcher::new(recorder.clone());
 
@@ -183,7 +183,7 @@ async fn a_scraper_dies_is_reported_and_recovers_while_a_nightly_job_stays_quiet
 #[tokio::test]
 async fn a_job_dead_before_the_watchdog_started_is_reported_from_process_start() {
     let config = load();
-    let state = SharedState::new(State::new(at(START), &config.jobs));
+    let state = SharedState::new(State::new(at(START), &config.jobs, &config.checks));
     let recorder = Arc::new(Recorder::default());
     let mut dispatcher = Dispatcher::new(recorder.clone());
 
@@ -213,7 +213,7 @@ async fn a_job_dead_before_the_watchdog_started_is_reported_from_process_start()
 #[tokio::test]
 async fn a_fresh_start_is_quiet_until_a_threshold_is_actually_crossed() {
     let config = load();
-    let state = SharedState::new(State::new(at(START), &config.jobs));
+    let state = SharedState::new(State::new(at(START), &config.jobs, &config.checks));
     let recorder = Arc::new(Recorder::default());
     let mut dispatcher = Dispatcher::new(recorder.clone());
 
@@ -238,7 +238,7 @@ async fn a_quiet_by_design_job_is_never_paged_on_however_long_it_waits() {
         .collect();
     assert_eq!(jobs.len(), 1);
 
-    let state = SharedState::new(State::new(at(START), &jobs));
+    let state = SharedState::new(State::new(at(START), &jobs, &[]));
     let recorder = Arc::new(Recorder::default());
     let mut dispatcher = Dispatcher::new(recorder.clone());
 

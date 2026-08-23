@@ -141,7 +141,7 @@ mod tests {
     }
 
     fn state(jobs: &[JobConfig]) -> State {
-        State::new(at(STARTED), jobs)
+        State::new(at(STARTED), jobs, &[])
     }
 
     fn severities(assessments: &[Assessment]) -> Vec<(&str, Severity)> {

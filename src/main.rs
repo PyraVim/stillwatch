@@ -71,7 +71,7 @@ async fn run(cli: Cli) -> Result<(), StartupError> {
     let config = Config::load(&path, &env)?;
     describe(&config);
 
-    let state = SharedState::new(State::new(SystemTime::now(), &config.jobs));
+    let state = SharedState::new(State::new(SystemTime::now(), &config.jobs, &config.checks));
 
     let notifier: Arc<dyn Notifier> = match &config.telegram {
         Some(telegram) => Arc::new(Telegram::new(telegram)),
