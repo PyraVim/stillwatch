@@ -1,11 +1,11 @@
 //! In-memory state. No database — a watchdog that needs its own datastore is a
 //! second thing that can fail.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, SystemTime};
 
-use crate::config::{AliveConfig, CheckConfig, JobConfig};
+use crate::config::{CheckConfig, JobConfig};
 
 /// Everything the evaluator is allowed to look at.
 #[derive(Debug)]
@@ -27,16 +27,135 @@ pub struct State {
 
 #[derive(Debug, Clone)]
 pub struct JobState {
-    pub name: String,
-
-    /// `None` for a job that declared no liveness expectation.
-    pub alive: Option<AliveConfig>,
+    pub config: JobConfig,
 
     /// `None` until the first beat arrives. Not a stand-in for "long ago" —
     /// absence of history is its own fact.
     pub last_beat: Option<SystemTime>,
 
+    /// When the job last reported that it actually did something.
+    ///
+    /// `None` means it never has, which is a different fact from "not for a
+    /// while" and leads to a different alert. Only an explicit `worked: true`
+    /// sets this — a bare beat says the loop ran, not that it accomplished
+    /// anything, and that distinction is the whole point of the two signals.
+    pub last_worked: Option<SystemTime>,
+
+    /// How fresh the data was, as of the last beat that said so.
+    ///
+    /// `None` means no beat has ever carried `data_ts`. Such a job is not stale;
+    /// it is unjudged, and reporting it as fresh would be a lie in the direction
+    /// that costs the most.
+    pub last_data_ts: Option<SystemTime>,
+
     pub beats: u64,
+
+    /// Per-beat counter snapshots, oldest first. Empty when the job has no
+    /// ratio rules, so a job nobody asked about costs nothing to remember.
+    counters: VecDeque<CounterSample>,
+
+    /// Every counter name this job has ever reported.
+    ///
+    /// Kept beyond the sample window so that a ratio naming a counter that has
+    /// *never* arrived can be told apart from one whose counter simply has not
+    /// arrived lately. The first is a typo; the second is a quiet hour.
+    seen_counters: BTreeSet<String>,
+}
+
+/// The counters carried by one beat.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CounterSample {
+    pub at: SystemTime,
+    pub counters: BTreeMap<String, f64>,
+}
+
+/// The optional detail a beat may carry beyond "the loop ran".
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct BeatDetail {
+    pub worked: Option<bool>,
+    pub data_ts: Option<SystemTime>,
+    pub counters: BTreeMap<String, f64>,
+}
+
+impl JobState {
+    pub fn name(&self) -> &str {
+        &self.config.name
+    }
+
+    /// How far back counter samples are kept: the longest ratio window, plus a
+    /// margin so a sum taken right at the edge is not short a beat.
+    fn counter_retention(&self) -> Option<Duration> {
+        let longest = self.config.ratios.iter().map(|ratio| ratio.window).max()?;
+        Some(longest + longest / 10)
+    }
+
+    /// Counter samples in `(now - window, now]`, oldest first.
+    pub fn counter_window(
+        &self,
+        window: Duration,
+        now: SystemTime,
+    ) -> impl Iterator<Item = &CounterSample> {
+        let start = now.checked_sub(window);
+        self.counters
+            .iter()
+            .filter(move |sample| start.is_none_or(|start| sample.at > start) && sample.at <= now)
+    }
+
+    /// Whether this counter name has ever appeared in any beat.
+    pub fn has_ever_seen(&self, counter: &str) -> bool {
+        self.seen_counters.contains(counter)
+    }
+
+    fn record(&mut self, at: SystemTime, detail: &BeatDetail) {
+        self.beats += 1;
+
+        // A backwards clock step must not make a live job look stale, so these
+        // only ever move forward.
+        self.last_beat = Some(forward(self.last_beat, at));
+
+        if detail.worked == Some(true) {
+            self.last_worked = Some(forward(self.last_worked, at));
+        }
+
+        if let Some(data_ts) = detail.data_ts {
+            self.last_data_ts = Some(data_ts);
+        }
+
+        for name in detail.counters.keys() {
+            if !self.seen_counters.contains(name) {
+                self.seen_counters.insert(name.clone());
+            }
+        }
+
+        let Some(retention) = self.counter_retention() else {
+            return;
+        };
+        if detail.counters.is_empty() {
+            return;
+        }
+
+        self.counters.push_back(CounterSample {
+            at,
+            counters: detail.counters.clone(),
+        });
+
+        if let Some(cutoff) = at.checked_sub(retention) {
+            while self
+                .counters
+                .front()
+                .is_some_and(|oldest| oldest.at < cutoff)
+            {
+                self.counters.pop_front();
+            }
+        }
+    }
+}
+
+fn forward(previous: Option<SystemTime>, candidate: SystemTime) -> SystemTime {
+    match previous {
+        Some(previous) if previous > candidate => previous,
+        _ => candidate,
+    }
 }
 
 /// What one probe found.
@@ -178,10 +297,13 @@ impl State {
             .iter()
             .map(|job| {
                 let state = JobState {
-                    name: job.name.clone(),
-                    alive: job.alive,
+                    config: job.clone(),
                     last_beat: None,
+                    last_worked: None,
+                    last_data_ts: None,
                     beats: 0,
+                    counters: VecDeque::new(),
+                    seen_counters: BTreeSet::new(),
                 };
                 (job.name.clone(), state)
             })
@@ -215,18 +337,18 @@ impl State {
     /// mistyped it, and inventing a job to match would leave the real one
     /// unwatched and nobody told.
     pub fn record_beat(&mut self, job: &str, at: SystemTime) -> bool {
-        let Some(state) = self.jobs.get_mut(job) else {
-            return false;
-        };
+        self.record_beat_with(job, at, &BeatDetail::default())
+    }
 
-        state.beats += 1;
-        // A backwards clock step must not make a live job look stale, so the
-        // last beat only ever moves forward.
-        state.last_beat = Some(match state.last_beat {
-            Some(previous) if previous > at => previous,
-            _ => at,
-        });
-        true
+    /// Records a beat carrying optional detail. Returns `false` for an unknown job.
+    pub fn record_beat_with(&mut self, job: &str, at: SystemTime, detail: &BeatDetail) -> bool {
+        match self.jobs.get_mut(job) {
+            Some(state) => {
+                state.record(at, detail);
+                true
+            }
+            None => false,
+        }
     }
 
     pub fn job(&self, name: &str) -> Option<&JobState> {
@@ -272,6 +394,11 @@ impl SharedState {
         self.lock().record_beat(job, at)
     }
 
+    /// Records a beat carrying optional detail. Returns `false` for an unknown job.
+    pub fn record_beat_with(&self, job: &str, at: SystemTime, detail: &BeatDetail) -> bool {
+        self.lock().record_beat_with(job, at, detail)
+    }
+
     /// Records a probe result. Returns `false` if no check by that name exists.
     pub fn record_probe(&self, check: &str, observation: Observation) -> bool {
         self.lock().record_probe(check, observation)
@@ -299,6 +426,7 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
+    use crate::config::AliveConfig;
     use crate::config::{DegradationConfig, ProbeConfig};
 
     fn at(secs: u64) -> SystemTime {
@@ -371,7 +499,7 @@ mod tests {
     #[test]
     fn jobs_are_visited_in_a_fixed_order() {
         let state = State::new(at(1_000), &jobs(), &[]);
-        let names: Vec<_> = state.jobs().map(|j| j.name.as_str()).collect();
+        let names: Vec<_> = state.jobs().map(|j| j.name()).collect();
         assert_eq!(names, ["nightly-sync", "product-scraper"]);
     }
 

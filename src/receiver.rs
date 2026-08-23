@@ -12,7 +12,7 @@
 //! valid heartbeat.
 
 use std::collections::BTreeMap;
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use axum::body::Bytes;
 use axum::extract::{Path, State};
@@ -22,7 +22,7 @@ use axum::routing::post;
 use axum::Router;
 use serde::Deserialize;
 
-use crate::state::SharedState;
+use crate::state::{BeatDetail, SharedState};
 
 /// The optional JSON body of a heartbeat.
 ///
@@ -41,6 +41,46 @@ pub struct Beat {
 
     /// Named counters. The job decides what they mean.
     pub counters: Option<BTreeMap<String, f64>>,
+}
+
+impl Beat {
+    /// Converts the wire body into recorded state, refusing values that cannot
+    /// mean anything.
+    ///
+    /// A `NaN` counter would silently poison every ratio it appears in — every
+    /// comparison against it is false, so the rule would quietly stop firing
+    /// forever. A negative count of things that happened is not a smaller
+    /// number, it is a mistake. Both are refused at the door with a 400 rather
+    /// than stored and reasoned about later.
+    fn into_detail(self) -> Result<BeatDetail, String> {
+        let counters = self.counters.unwrap_or_default();
+        for (name, value) in &counters {
+            if !value.is_finite() {
+                return Err(format!(
+                    "counter {name:?} is {value}, which is not a number"
+                ));
+            }
+            if *value < 0.0 {
+                return Err(format!("counter {name:?} is negative ({value})"));
+            }
+        }
+
+        let data_ts = match self.data_ts {
+            None => None,
+            Some(seconds) if seconds < 0 => {
+                return Err(format!(
+                    "data_ts {seconds} is before 1970, which is not a time any data was read at"
+                ))
+            }
+            Some(seconds) => Some(SystemTime::UNIX_EPOCH + Duration::from_secs(seconds as u64)),
+        };
+
+        Ok(BeatDetail {
+            worked: self.worked,
+            data_ts,
+            counters,
+        })
+    }
 }
 
 pub fn router(state: SharedState) -> Router {
@@ -72,17 +112,27 @@ async fn beat(State(state): State<SharedState>, Path(job): Path<String>, body: B
         }
     };
 
-    if let Some(beat) = &detail {
-        tracing::debug!(
-            %job,
-            worked = ?beat.worked,
-            data_ts = ?beat.data_ts,
-            counters = ?beat.counters,
-            "beat carried a body"
-        );
-    }
+    let detail = match detail {
+        Some(beat) => {
+            tracing::debug!(
+                %job,
+                worked = ?beat.worked,
+                data_ts = ?beat.data_ts,
+                counters = ?beat.counters,
+                "beat carried a body"
+            );
+            match beat.into_detail() {
+                Ok(detail) => detail,
+                Err(complaint) => {
+                    tracing::warn!(%job, %complaint, "rejecting a beat; not counting it");
+                    return (StatusCode::BAD_REQUEST, format!("{complaint}\n")).into_response();
+                }
+            }
+        }
+        None => BeatDetail::default(),
+    };
 
-    if !state.record_beat(&job, SystemTime::now()) {
+    if !state.record_beat_with(&job, SystemTime::now(), &detail) {
         // Accepting a beat for a name nobody configured would leave the real
         // job unwatched and say nothing about it — the exact quiet failure this
         // tool exists to catch. Say so, loudly, to both ends.
@@ -321,6 +371,133 @@ mod tests {
             .expect("router should respond");
 
         assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
+    }
+
+    // -- the detail a beat carries -----------------------------------------
+
+    #[tokio::test]
+    async fn a_beat_records_worked_data_ts_and_counters() {
+        let state = shared();
+
+        let (status, _) = post_beat(
+            &state,
+            "product-scraper",
+            Some(r#"{"worked":true,"data_ts":1724500000,"counters":{"fetched":120,"parsed":118}}"#),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        state.read(|s| {
+            let job = s.job("product-scraper").expect("job");
+            assert!(job.last_worked.is_some());
+            assert_eq!(
+                job.last_data_ts,
+                Some(SystemTime::UNIX_EPOCH + Duration::from_secs(1_724_500_000))
+            );
+            assert!(job.has_ever_seen("fetched"));
+            assert!(job.has_ever_seen("parsed"));
+            assert!(!job.has_ever_seen("stored"));
+        });
+    }
+
+    /// A bare beat says the loop ran. It does not claim any work was done, and
+    /// treating it as work would collapse the two signals the tool exists to
+    /// keep apart.
+    #[tokio::test]
+    async fn a_bare_beat_does_not_count_as_work() {
+        let state = shared();
+
+        post_beat(&state, "product-scraper", None).await;
+        post_beat(&state, "product-scraper", Some(r#"{"worked":false}"#)).await;
+
+        state.read(|s| {
+            let job = s.job("product-scraper").expect("job");
+            assert_eq!(job.beats, 2);
+            assert_eq!(
+                job.last_worked, None,
+                "only an explicit worked:true marks work"
+            );
+        });
+    }
+
+    /// `NaN` and infinity compare false against everything, so a single one
+    /// would silently stop a ratio rule firing for good.
+    ///
+    /// JSON has no literal for either, and `serde_json` refuses out-of-range
+    /// numbers before the guard in `into_detail` is reached — so what is
+    /// asserted here is the property rather than which layer enforces it. The
+    /// guard stays as a backstop because `BeatDetail` is public and the cost of
+    /// being wrong is a rule that never fires again.
+    #[tokio::test]
+    async fn a_counter_that_is_not_a_finite_number_never_reaches_state() {
+        let state = shared();
+
+        for body in [
+            r#"{"counters":{"fetched":1e999}}"#,
+            r#"{"counters":{"fetched":-1e999}}"#,
+        ] {
+            let (status, _) = post_beat(&state, "product-scraper", Some(body)).await;
+
+            assert_eq!(status, StatusCode::BAD_REQUEST, "for {body}");
+            assert_eq!(
+                beats(&state, "product-scraper"),
+                0,
+                "a value that would poison every ratio must not be recorded"
+            );
+        }
+    }
+
+    #[test]
+    fn the_backstop_refuses_non_finite_counters_directly() {
+        let beat = Beat {
+            worked: None,
+            data_ts: None,
+            counters: Some(BTreeMap::from([("fetched".to_string(), f64::NAN)])),
+        };
+
+        let err = beat.into_detail().expect_err("NaN must be refused");
+        assert!(err.contains("fetched"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn a_negative_counter_is_refused() {
+        let state = shared();
+
+        let (status, body) = post_beat(
+            &state,
+            "product-scraper",
+            Some(r#"{"counters":{"parsed":-4}}"#),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(body.contains("negative"), "{body}");
+        assert_eq!(beats(&state, "product-scraper"), 0);
+    }
+
+    #[tokio::test]
+    async fn a_data_ts_before_the_epoch_is_refused() {
+        let state = shared();
+
+        let (status, body) = post_beat(&state, "product-scraper", Some(r#"{"data_ts":-5}"#)).await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(body.contains("1970"), "{body}");
+    }
+
+    #[tokio::test]
+    async fn a_zero_counter_is_perfectly_valid() {
+        let state = shared();
+
+        let (status, _) = post_beat(
+            &state,
+            "product-scraper",
+            Some(r#"{"counters":{"fetched":10,"parsed":0}}"#),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK, "parsing nothing is a real outcome");
+        assert_eq!(beats(&state, "product-scraper"), 1);
     }
 
     #[tokio::test]

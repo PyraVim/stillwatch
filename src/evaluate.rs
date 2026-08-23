@@ -249,7 +249,7 @@ fn assess_alive(job: &JobState, watch_started: SystemTime, now: SystemTime) -> O
     // no such thing as it being late. A nightly sync that is legitimately quiet
     // for twenty-three hours must not be judged against a rule it never agreed
     // to.
-    let alive = job.alive?;
+    let alive = job.config.alive?;
 
     let (since, measured_from) = match job.last_beat {
         Some(last) => (LastSeen::Beat(last), last),
@@ -269,7 +269,7 @@ fn assess_alive(job: &JobState, watch_started: SystemTime, now: SystemTime) -> O
     };
 
     Some(Assessment {
-        subject: job.name.clone(),
+        subject: job.name().to_string(),
         severity,
         reason: Reason::NoHeartbeat {
             silent_for,
