@@ -14,11 +14,12 @@
 use std::collections::BTreeMap;
 use std::time::SystemTime;
 
+use axum::body::Bytes;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
-use axum::{Json, Router};
+use axum::Router;
 use serde::Deserialize;
 
 use crate::state::SharedState;
@@ -48,12 +49,30 @@ pub fn router(state: SharedState) -> Router {
         .with_state(state)
 }
 
-async fn beat(
-    State(state): State<SharedState>,
-    Path(job): Path<String>,
-    body: Option<Json<Beat>>,
-) -> Response {
-    if let Some(Json(beat)) = &body {
+async fn beat(State(state): State<SharedState>, Path(job): Path<String>, body: Bytes) -> Response {
+    // The body is parsed here rather than by a `Json` extractor on purpose.
+    // `Json` refuses anything whose content-type is not JSON, and plenty of
+    // HTTP clients attach a default content-type even to a request with no body
+    // at all — which would turn a documented bare heartbeat into a 415 for some
+    // languages and not others. The protocol says every field is optional, so
+    // an empty body is simply an empty body, whatever the headers claim.
+    let detail = if body.iter().all(u8::is_ascii_whitespace) {
+        None
+    } else {
+        match serde_json::from_slice::<Beat>(&body) {
+            Ok(beat) => Some(beat),
+            Err(err) => {
+                tracing::warn!(%job, %err, "beat body is not valid json; not counting it");
+                return (
+                    StatusCode::BAD_REQUEST,
+                    format!("body is not valid json: {err}\n"),
+                )
+                    .into_response();
+            }
+        }
+    };
+
+    if let Some(beat) = &detail {
         tracing::debug!(
             %job,
             worked = ?beat.worked,
@@ -111,16 +130,27 @@ mod tests {
     }
 
     async fn post_beat(state: &SharedState, job: &str, body: Option<&str>) -> (StatusCode, String) {
-        let request = Request::builder()
+        match body {
+            Some(json) => post_raw(state, job, Some("application/json"), json).await,
+            None => post_raw(state, job, None, "").await,
+        }
+    }
+
+    async fn post_raw(
+        state: &SharedState,
+        job: &str,
+        content_type: Option<&str>,
+        body: &str,
+    ) -> (StatusCode, String) {
+        let mut builder = Request::builder()
             .method("POST")
             .uri(format!("/beat/{job}"));
-        let request = match body {
-            Some(json) => request
-                .header("content-type", "application/json")
-                .body(Body::from(json.to_string())),
-            None => request.body(Body::empty()),
+        if let Some(content_type) = content_type {
+            builder = builder.header("content-type", content_type);
         }
-        .expect("request should build");
+        let request = builder
+            .body(Body::from(body.to_string()))
+            .expect("request should build");
 
         let response = router(state.clone())
             .oneshot(request)
@@ -147,6 +177,58 @@ mod tests {
         let state = shared();
 
         let (status, _) = post_beat(&state, "nightly-sync", None).await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(beats(&state, "nightly-sync"), 1);
+    }
+
+    /// Regression: an earlier version used axum's `Option<Json<Beat>>`, which
+    /// answers 415 whenever the content-type is set to anything that is not
+    /// JSON. Several HTTP clients attach a default content-type even to a
+    /// bodyless POST, so the documented bare heartbeat worked from curl and
+    /// failed from PowerShell. The body is what decides, never the header.
+    #[tokio::test]
+    async fn a_bare_post_is_accepted_whatever_content_type_the_client_invents() {
+        for content_type in [
+            None,
+            Some("application/x-www-form-urlencoded"),
+            Some("text/plain"),
+            Some("application/json"),
+        ] {
+            let state = shared();
+
+            let (status, _) = post_raw(&state, "nightly-sync", content_type, "").await;
+
+            assert_eq!(
+                status,
+                StatusCode::OK,
+                "a bare POST with content-type {content_type:?} must be a valid heartbeat"
+            );
+            assert_eq!(beats(&state, "nightly-sync"), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_json_body_is_read_even_without_a_json_content_type() {
+        let state = shared();
+
+        let (status, _) = post_raw(
+            &state,
+            "product-scraper",
+            Some("text/plain"),
+            r#"{"worked":true}"#,
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(beats(&state, "product-scraper"), 1);
+    }
+
+    #[tokio::test]
+    async fn a_whitespace_only_body_counts_as_no_body() {
+        let state = shared();
+
+        let (status, _) = post_raw(&state, "nightly-sync", None, "\n  \n").await;
 
         assert_eq!(status, StatusCode::OK);
         assert_eq!(beats(&state, "nightly-sync"), 1);

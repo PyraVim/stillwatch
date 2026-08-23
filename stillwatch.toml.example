@@ -1,0 +1,101 @@
+# stillwatch — example configuration
+#
+# Copy this to stillwatch.toml and edit. Everything here has a sensible default
+# except job names, so a minimal working config is four lines:
+#
+#     [[job]]
+#     name = "nightly-sync"
+#       [job.alive]
+#       expect_every = "60s"
+#
+# Run it with:
+#     stillwatch --config stillwatch.toml
+#
+# The config path also comes from $STILLWATCH_CONFIG, and falls back to
+# ./stillwatch.toml.
+
+
+# Where the heartbeat receiver listens. Defaults to 127.0.0.1:9111.
+listen = "127.0.0.1:9111"
+
+
+# ---------------------------------------------------------------------------
+# Notification
+# ---------------------------------------------------------------------------
+#
+# ${VAR} is expanded from the environment in any value in this file, so no
+# secret ever has to sit on disk. A ${VAR} that is not set is a startup error
+# naming the variable — never an empty string that fails quietly later.
+#
+# For containers, any of these three values can also be set directly:
+#
+#     STILLWATCH_LISTEN
+#     STILLWATCH_NOTIFY_TELEGRAM_TOKEN
+#     STILLWATCH_NOTIFY_TELEGRAM_CHAT_ID
+#
+# The rule is: uppercase the dotted path and replace "." with "_". An
+# environment override wins over both the file and any ${VAR} in it. Per-job
+# values are deliberately not overridable this way — array entries have no
+# stable key to name them by.
+#
+# Leave this section out entirely and stillwatch still runs; it says so at
+# startup and writes alerts to the log instead of delivering them.
+
+[notify.telegram]
+token   = "${TELEGRAM_TOKEN}"
+chat_id = "${TELEGRAM_CHAT}"
+
+
+# ---------------------------------------------------------------------------
+# A continuously-running job
+# ---------------------------------------------------------------------------
+#
+# The job reports in with a bare POST, from any language, with no client
+# library and no dependency:
+#
+#     curl -fsS -X POST localhost:9111/beat/product-scraper
+#
+# A body is optional. `worked`, `data_ts` and `counters` are accepted and
+# logged today, and are what later versions will evaluate:
+#
+#     curl -fsS -X POST localhost:9111/beat/product-scraper \
+#       -H 'content-type: application/json' \
+#       -d '{"worked":true,"counters":{"fetched":120,"parsed":118}}'
+
+[[job]]
+name = "product-scraper"
+
+  [job.alive]
+  # How often the loop is expected to say it ran.
+  expect_every   = "60s"
+
+  # Silence longer than warn_after is a warning; longer than critical_after is
+  # critical. Both are optional and default to 5x and 15x expect_every, which
+  # is exactly the 60s / 5m / 15m below. warn_after must be longer than
+  # expect_every, or it would fire in the ordinary gap between two beats.
+  warn_after     = "5m"
+  critical_after = "15m"
+
+
+# ---------------------------------------------------------------------------
+# A job that is quiet by design
+# ---------------------------------------------------------------------------
+#
+# No [job.alive] block, so this job is never judged late. A nightly sync that
+# legitimately does nothing for twenty-three hours is healthy, and a job that
+# never declared a cadence does not inherit one. Its beats are still recorded,
+# and a beat for a name that is not configured here is refused with a 404 and
+# logged — a typo in the URL must not leave the real job silently unwatched.
+
+[[job]]
+name = "nightly-sync"
+
+
+# ---------------------------------------------------------------------------
+# Not yet implemented
+# ---------------------------------------------------------------------------
+#
+# This version evaluates the `alive` signal only. Config for anything else —
+# [job.worked], [job.freshness], [[job.ratio]], [[check]] — parses without
+# error but is not acted on, and stillwatch logs a warning at startup naming
+# each key it is ignoring, so a line that does nothing never does so quietly.

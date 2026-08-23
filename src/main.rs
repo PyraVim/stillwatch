@@ -3,13 +3,23 @@ use std::io;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::process::ExitCode;
-use std::time::SystemTime;
+use std::sync::Arc;
+use std::time::{Duration, SystemTime};
 
 use clap::Parser;
 use stillwatch::config::{self, Config, ConfigError, SystemEnv};
+use stillwatch::evaluate::evaluate;
+use stillwatch::notify::{Dispatcher, LogOnly, Notifier, Telegram};
 use stillwatch::state::{SharedState, State};
 use stillwatch::{fmt, receiver};
+use tokio::time::MissedTickBehavior;
 use tracing_subscriber::EnvFilter;
+
+/// How often the evaluator runs.
+///
+/// Not configurable: thresholds are minutes and the tick only bounds how late
+/// an alert can be, so there is nothing here worth a knob.
+const TICK: Duration = Duration::from_secs(5);
 
 #[derive(Parser)]
 #[command(
@@ -63,6 +73,12 @@ async fn run(cli: Cli) -> Result<(), StartupError> {
 
     let state = SharedState::new(State::new(SystemTime::now(), &config.jobs));
 
+    let notifier: Arc<dyn Notifier> = match &config.telegram {
+        Some(telegram) => Arc::new(Telegram::new(telegram)),
+        None => Arc::new(LogOnly),
+    };
+    tracing::info!(channel = notifier.channel(), "notifier ready");
+
     let listener = tokio::net::TcpListener::bind(config.listen)
         .await
         .map_err(|source| StartupError::Listen {
@@ -72,10 +88,37 @@ async fn run(cli: Cli) -> Result<(), StartupError> {
 
     tracing::info!(listen = %config.listen, "receiver ready");
 
-    axum::serve(listener, receiver::router(state))
+    let evaluator = tokio::spawn(watch(state.clone(), Dispatcher::new(notifier)));
+
+    let served = axum::serve(listener, receiver::router(state))
         .with_graceful_shutdown(shutdown())
-        .await
-        .map_err(StartupError::Serve)
+        .await;
+
+    evaluator.abort();
+    served.map_err(StartupError::Serve)
+}
+
+/// Evaluates every job on a fixed tick and hands whatever is wrong to the
+/// dispatcher.
+///
+/// The system clock is read exactly here and nowhere below: `evaluate` is given
+/// the time rather than reading it, which is what makes it testable without
+/// sleeping.
+async fn watch(state: SharedState, mut dispatcher: Dispatcher) {
+    let mut ticker = tokio::time::interval(TICK);
+    // If the machine suspends, catching up on every missed tick would fire a
+    // burst of identical evaluations. One late tick is enough.
+    ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
+
+    loop {
+        ticker.tick().await;
+        let now = SystemTime::now();
+
+        // The lock is released before any awaiting happens.
+        let assessments = state.read(|state| evaluate(state, now));
+
+        dispatcher.dispatch(&assessments, now).await;
+    }
 }
 
 /// Says out loud what is and is not being watched, so a misconfiguration is
