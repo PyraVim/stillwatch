@@ -524,20 +524,20 @@ mod tests {
     /// A continuously-running job: expected every 60s, warn at 5m, critical at 15m.
     fn scraper() -> JobConfig {
         JobConfig {
-            name: "product-scraper".into(),
             alive: Some(AliveConfig {
                 expect_every: Duration::from_secs(60),
                 warn_after: Duration::from_secs(300),
                 critical_after: Duration::from_secs(900),
             }),
+            ..JobConfig::named("product-scraper")
         }
     }
 
     /// A job that is quiet by design and declares no liveness expectation.
     fn nightly() -> JobConfig {
         JobConfig {
-            name: "nightly-sync".into(),
             alive: None,
+            ..JobConfig::named("nightly-sync")
         }
     }
 
@@ -1280,12 +1280,12 @@ mod tests {
     #[test]
     fn assessments_come_out_in_a_fixed_order() {
         let alive_nightly = JobConfig {
-            name: "nightly-sync".into(),
             alive: Some(AliveConfig {
                 expect_every: Duration::from_secs(60),
                 warn_after: Duration::from_secs(300),
                 critical_after: Duration::from_secs(900),
             }),
+            ..JobConfig::named("nightly-sync")
         };
         let state = state(&[scraper(), alive_nightly]);
 

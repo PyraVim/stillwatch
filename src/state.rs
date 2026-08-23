@@ -308,16 +308,16 @@ mod tests {
     fn jobs() -> Vec<JobConfig> {
         vec![
             JobConfig {
-                name: "product-scraper".into(),
                 alive: Some(AliveConfig {
                     expect_every: Duration::from_secs(60),
                     warn_after: Duration::from_secs(300),
                     critical_after: Duration::from_secs(900),
                 }),
+                ..JobConfig::named("product-scraper")
             },
             JobConfig {
-                name: "nightly-sync".into(),
                 alive: None,
+                ..JobConfig::named("nightly-sync")
             },
         ]
     }

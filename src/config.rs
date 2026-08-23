@@ -51,6 +51,9 @@ const DEFAULT_MIN_SAMPLES: usize = 30;
 /// "Current" latency is the last this many probes.
 const RECENT_INTERVALS: u32 = 20;
 
+/// Denominator total a ratio rule needs before it is judged, when not configured.
+const DEFAULT_MIN_SAMPLE: u64 = 30;
+
 /// Scalar config paths that a `STILLWATCH_*` environment variable may override.
 ///
 /// The mapping is: uppercase the dotted path and replace `.` with `_`. We
@@ -179,11 +182,38 @@ impl fmt::Debug for TelegramConfig {
 #[derive(Debug, Clone)]
 pub struct JobConfig {
     pub name: String,
+
     /// `None` when the job declares no `[job.alive]` block.
     ///
     /// A job that is quiet by design must not inherit a liveness expectation it
-    /// never agreed to, so this stays `None` rather than defaulting.
+    /// never agreed to, so this stays `None` rather than defaulting. The same
+    /// goes for every other signal below.
     pub alive: Option<AliveConfig>,
+
+    /// How long the job may go without doing real work.
+    pub worked: Option<SilenceConfig>,
+
+    /// How stale the data the job acts on may get.
+    pub freshness: Option<SilenceConfig>,
+
+    /// Named counter ratios. Empty when the job declares none.
+    pub ratios: Vec<RatioConfig>,
+}
+
+impl JobConfig {
+    /// A job with a name and no rules at all — watched for nothing.
+    ///
+    /// Every signal is opt-in, so this is the honest starting point rather than
+    /// a degenerate case. Struct-update syntax builds the rest.
+    pub fn named(name: &str) -> Self {
+        Self {
+            name: name.to_string(),
+            alive: None,
+            worked: None,
+            freshness: None,
+            ratios: Vec::new(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -191,6 +221,50 @@ pub struct AliveConfig {
     pub expect_every: Duration,
     pub warn_after: Duration,
     pub critical_after: Duration,
+}
+
+/// Thresholds on how long something may go unreported.
+///
+/// Shared by `worked` and `freshness` because they are the same shape: a
+/// duration that is fine, then concerning, then bad. Unlike `alive` there is no
+/// `expect_every` to derive defaults from — these signals are irregular by
+/// nature, which is the whole reason they are separate from liveness.
+#[derive(Debug, Clone, Copy)]
+pub struct SilenceConfig {
+    pub warn_after: Duration,
+
+    /// Optional. A job may reasonably want "tell me" without "wake me".
+    pub critical_after: Option<Duration>,
+}
+
+/// A rule over two named counters.
+///
+/// The job decides what the counters mean; this decides what is alarming. A
+/// scraper reports `fetched`/`parsed`, an ETL reports `rows_read`/`rows_written`,
+/// a bot reports `submitted`/`landed`. Same machinery, no domain knowledge.
+#[derive(Debug, Clone)]
+pub struct RatioConfig {
+    /// What to call this rule in an alert: "parse rate", "write rate".
+    pub name: String,
+
+    pub numerator: String,
+    pub denominator: String,
+
+    /// How far back counters are summed.
+    pub window: Duration,
+
+    /// The floor the ratio must stay at or above.
+    pub min: f64,
+
+    /// The denominator total needed before the rule is judged at all.
+    ///
+    /// Guaranteed at least 1 by validation, which is what makes computing the
+    /// ratio safe: the rule is skipped as unjudged long before the denominator
+    /// could be zero.
+    pub min_sample: u64,
+
+    /// What the operator wants said when it fires.
+    pub message: Option<String>,
 }
 
 /// A dependency probed directly, on its own schedule.
@@ -408,7 +482,12 @@ fn warn_unrecognized(root: &toml::Table) {
                 };
                 for (index, job) in jobs.iter().enumerate() {
                     let path = format!("job[{index}]");
-                    warn_children(job, &path, &["name", "alive"], |_| {});
+                    warn_children(
+                        job,
+                        &path,
+                        &["name", "alive", "worked", "freshness", "ratio"],
+                        |_| {},
+                    );
                     if let Some(alive) = job.get("alive") {
                         warn_children(
                             alive,
@@ -416,6 +495,34 @@ fn warn_unrecognized(root: &toml::Table) {
                             &["expect_every", "warn_after", "critical_after"],
                             |_| {},
                         );
+                    }
+                    for signal in ["worked", "freshness"] {
+                        if let Some(block) = job.get(signal) {
+                            warn_children(
+                                block,
+                                &format!("{path}.{signal}"),
+                                &["warn_after", "critical_after"],
+                                |_| {},
+                            );
+                        }
+                    }
+                    if let Some(ratios) = job.get("ratio").and_then(Value::as_array) {
+                        for (r, ratio) in ratios.iter().enumerate() {
+                            warn_children(
+                                ratio,
+                                &format!("{path}.ratio[{r}]"),
+                                &[
+                                    "name",
+                                    "numerator",
+                                    "denominator",
+                                    "window",
+                                    "min",
+                                    "min_sample",
+                                    "message",
+                                ],
+                                |_| {},
+                            );
+                        }
                     }
                 }
             }
@@ -512,6 +619,30 @@ struct RawTelegram {
 struct RawJob {
     name: String,
     alive: Option<RawAlive>,
+    worked: Option<RawSilence>,
+    freshness: Option<RawSilence>,
+    #[serde(default, rename = "ratio")]
+    ratios: Vec<RawRatio>,
+}
+
+#[derive(Deserialize)]
+struct RawSilence {
+    #[serde(with = "humantime_serde")]
+    warn_after: Duration,
+    #[serde(default, with = "humantime_serde")]
+    critical_after: Option<Duration>,
+}
+
+#[derive(Deserialize)]
+struct RawRatio {
+    name: String,
+    numerator: String,
+    denominator: String,
+    #[serde(with = "humantime_serde")]
+    window: Duration,
+    min: f64,
+    min_sample: Option<u64>,
+    message: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -785,9 +916,129 @@ impl RawJob {
     fn resolve(self) -> Result<JobConfig, ConfigError> {
         validate_job_name(&self.name)?;
         let alive = self.alive.map(|a| a.resolve(&self.name)).transpose()?;
+
+        let worked = self
+            .worked
+            .map(|w| w.resolve(&self.name, "worked"))
+            .transpose()?;
+        let freshness = self
+            .freshness
+            .map(|f| f.resolve(&self.name, "freshness"))
+            .transpose()?;
+
+        let mut ratios: Vec<RatioConfig> = Vec::with_capacity(self.ratios.len());
+        for raw in self.ratios {
+            let ratio = raw.resolve(&self.name)?;
+            // Ratio names key the dedup for their own alerts, so two rules on
+            // one job sharing a name would suppress each other.
+            if ratios.iter().any(|existing| existing.name == ratio.name) {
+                return Err(ConfigError::InvalidThreshold {
+                    job: self.name.clone(),
+                    message: format!(
+                        "two ratio rules are both named {:?}; names must be unique within a job",
+                        ratio.name
+                    ),
+                });
+            }
+            ratios.push(ratio);
+        }
+
         Ok(JobConfig {
             name: self.name,
             alive,
+            worked,
+            freshness,
+            ratios,
+        })
+    }
+}
+
+impl RawSilence {
+    fn resolve(self, job: &str, signal: &str) -> Result<SilenceConfig, ConfigError> {
+        let invalid = |message: String| ConfigError::InvalidThreshold {
+            job: job.to_string(),
+            message,
+        };
+
+        if self.warn_after.is_zero() {
+            return Err(invalid(format!(
+                "{signal}.warn_after must be greater than zero"
+            )));
+        }
+
+        if let Some(critical_after) = self.critical_after {
+            if critical_after <= self.warn_after {
+                return Err(invalid(format!(
+                    "{signal}.critical_after ({}) must be longer than {signal}.warn_after ({})",
+                    crate::fmt::duration(critical_after),
+                    crate::fmt::duration(self.warn_after),
+                )));
+            }
+        }
+
+        Ok(SilenceConfig {
+            warn_after: self.warn_after,
+            critical_after: self.critical_after,
+        })
+    }
+}
+
+impl RawRatio {
+    fn resolve(self, job: &str) -> Result<RatioConfig, ConfigError> {
+        let invalid = |message: String| ConfigError::InvalidThreshold {
+            job: job.to_string(),
+            message,
+        };
+
+        if self.name.trim().is_empty() {
+            return Err(invalid("a ratio rule needs a name".to_string()));
+        }
+        if self.numerator.is_empty() || self.denominator.is_empty() {
+            return Err(invalid(format!(
+                "ratio {:?} needs both a numerator and a denominator counter",
+                self.name
+            )));
+        }
+        if self.numerator == self.denominator {
+            return Err(invalid(format!(
+                "ratio {:?} divides {:?} by itself, which is always 1",
+                self.name, self.numerator
+            )));
+        }
+        if self.window.is_zero() {
+            return Err(invalid(format!(
+                "ratio {:?}: window must be greater than zero",
+                self.name
+            )));
+        }
+        if !(self.min.is_finite() && self.min > 0.0 && self.min <= 1.0) {
+            return Err(invalid(format!(
+                "ratio {:?}: min ({}) must be greater than 0 and at most 1",
+                self.name, self.min
+            )));
+        }
+
+        // At least one, always. The rule is reported as unjudged until the
+        // denominator reaches this, so the ratio is never computed against a
+        // zero denominator — the check below is what makes the division safe
+        // rather than a guard at the point of division.
+        let min_sample = self.min_sample.unwrap_or(DEFAULT_MIN_SAMPLE);
+        if min_sample == 0 {
+            return Err(invalid(format!(
+                "ratio {:?}: min_sample must be at least 1; a ratio computed from no \
+                 observations would be a division by zero",
+                self.name
+            )));
+        }
+
+        Ok(RatioConfig {
+            name: self.name,
+            numerator: self.numerator,
+            denominator: self.denominator,
+            window: self.window,
+            min: self.min,
+            min_sample,
+            message: self.message,
         })
     }
 }
@@ -1243,6 +1494,221 @@ url = "https://api.vendor.com/health"
 
         assert_eq!(config.jobs.len(), 1);
         assert!(config.jobs[0].alive.is_some());
+    }
+
+    // -- worked, freshness, ratios ----------------------------------------
+
+    #[test]
+    fn the_spec_example_quiet_job_resolves() {
+        let config = load(
+            r#"
+[[job]]
+name = "nightly-sync"
+
+  [job.worked]
+  warn_after     = "26h"
+  critical_after = "50h"
+
+  [[job.ratio]]
+  name        = "write rate"
+  numerator   = "rows_written"
+  denominator = "rows_read"
+  window      = "24h"
+  min         = 0.99
+  min_sample  = 100
+"#,
+        );
+
+        let job = &config.jobs[0];
+        let worked = job.worked.expect("worked");
+        assert_eq!(worked.warn_after, Duration::from_secs(26 * 3_600));
+        assert_eq!(worked.critical_after, Some(Duration::from_secs(50 * 3_600)));
+
+        assert_eq!(job.ratios.len(), 1);
+        assert_eq!(job.ratios[0].name, "write rate");
+        assert_eq!(job.ratios[0].numerator, "rows_written");
+        assert_eq!(job.ratios[0].min_sample, 100);
+        assert!(job.ratios[0].message.is_none());
+    }
+
+    /// A job may want telling without waking anyone, so `critical_after` is
+    /// optional on the irregular signals.
+    #[test]
+    fn worked_and_freshness_may_declare_a_warning_only() {
+        let config = load(
+            r#"
+[[job]]
+name = "nightly-sync"
+  [job.freshness]
+  warn_after = "26h"
+"#,
+        );
+
+        let freshness = config.jobs[0].freshness.expect("freshness");
+        assert_eq!(freshness.warn_after, Duration::from_secs(26 * 3_600));
+        assert_eq!(freshness.critical_after, None);
+    }
+
+    #[test]
+    fn a_job_declaring_none_of_the_irregular_signals_gets_none_of_them() {
+        let config = load("[[job]]\nname = \"nightly-sync\"\n");
+        let job = &config.jobs[0];
+
+        assert!(job.alive.is_none());
+        assert!(job.worked.is_none());
+        assert!(job.freshness.is_none());
+        assert!(job.ratios.is_empty());
+    }
+
+    #[test]
+    fn silence_thresholds_must_be_ordered() {
+        let err = Config::from_toml(
+            r#"
+[[job]]
+name = "nightly-sync"
+  [job.worked]
+  warn_after     = "50h"
+  critical_after = "26h"
+"#,
+            &no_env(),
+        )
+        .expect_err("should fail");
+
+        assert!(err.to_string().contains("worked.critical_after"), "{err}");
+    }
+
+    #[test]
+    fn a_ratio_gets_a_default_min_sample() {
+        let config = load(
+            r#"
+[[job]]
+name = "product-scraper"
+  [[job.ratio]]
+  name        = "parse rate"
+  numerator   = "parsed"
+  denominator = "fetched"
+  window      = "1h"
+  min         = 0.9
+"#,
+        );
+
+        assert_eq!(config.jobs[0].ratios[0].min_sample, 30);
+    }
+
+    /// `min_sample` of zero is the only way the ratio could ever be computed
+    /// against a zero denominator, so it is refused at startup.
+    #[test]
+    fn a_ratio_min_sample_of_zero_is_rejected() {
+        let err = Config::from_toml(
+            r#"
+[[job]]
+name = "product-scraper"
+  [[job.ratio]]
+  name        = "parse rate"
+  numerator   = "parsed"
+  denominator = "fetched"
+  window      = "1h"
+  min         = 0.9
+  min_sample  = 0
+"#,
+            &no_env(),
+        )
+        .expect_err("should fail");
+
+        assert!(err.to_string().contains("division by zero"), "{err}");
+    }
+
+    #[test]
+    fn a_ratio_min_outside_zero_to_one_is_rejected() {
+        for min in ["0.0", "1.5", "-0.5"] {
+            let text = format!(
+                r#"
+[[job]]
+name = "product-scraper"
+  [[job.ratio]]
+  name        = "parse rate"
+  numerator   = "parsed"
+  denominator = "fetched"
+  window      = "1h"
+  min         = {min}
+"#
+            );
+            let err = Config::from_toml(&text, &no_env()).expect_err("should fail");
+            assert!(err.to_string().contains("min"), "min {min}: {err}");
+        }
+    }
+
+    #[test]
+    fn a_ratio_dividing_a_counter_by_itself_is_rejected() {
+        let err = Config::from_toml(
+            r#"
+[[job]]
+name = "product-scraper"
+  [[job.ratio]]
+  name        = "parse rate"
+  numerator   = "fetched"
+  denominator = "fetched"
+  window      = "1h"
+  min         = 0.9
+"#,
+            &no_env(),
+        )
+        .expect_err("should fail");
+
+        assert!(err.to_string().contains("always 1"), "{err}");
+    }
+
+    #[test]
+    fn two_ratios_on_one_job_may_not_share_a_name() {
+        let err = Config::from_toml(
+            r#"
+[[job]]
+name = "product-scraper"
+  [[job.ratio]]
+  name        = "parse rate"
+  numerator   = "parsed"
+  denominator = "fetched"
+  window      = "1h"
+  min         = 0.9
+  [[job.ratio]]
+  name        = "parse rate"
+  numerator   = "stored"
+  denominator = "parsed"
+  window      = "1h"
+  min         = 0.9
+"#,
+            &no_env(),
+        )
+        .expect_err("should fail");
+
+        assert!(err.to_string().contains("must be unique"), "{err}");
+    }
+
+    #[test]
+    fn a_job_may_carry_several_differently_named_ratios() {
+        let config = load(
+            r#"
+[[job]]
+name = "product-scraper"
+  [[job.ratio]]
+  name        = "parse rate"
+  numerator   = "parsed"
+  denominator = "fetched"
+  window      = "1h"
+  min         = 0.9
+  message     = "fetching fine, parsing broken — source markup likely changed"
+  [[job.ratio]]
+  name        = "store rate"
+  numerator   = "stored"
+  denominator = "parsed"
+  window      = "1h"
+  min         = 0.95
+"#,
+        );
+
+        assert_eq!(config.jobs[0].ratios.len(), 2);
+        assert!(config.jobs[0].ratios[0].message.is_some());
+        assert!(config.jobs[0].ratios[1].message.is_none());
     }
 
     // -- checks ------------------------------------------------------------
