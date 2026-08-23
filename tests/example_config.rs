@@ -45,6 +45,27 @@ fn the_example_covers_a_continuous_job_and_a_quiet_one() {
     assert!(without_cadence >= 1, "expected a quiet-by-design example");
 }
 
+/// The example is the primary documentation for degradation config, so the
+/// block it shows has to be one that actually resolves.
+#[test]
+fn the_example_demonstrates_a_probed_dependency() {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("stillwatch.toml.example");
+    let config = Config::load(&path, &env()).expect("the example config must load");
+
+    let check = config.checks.first().expect("expected a [[check]] example");
+    let degradation = check
+        .degradation
+        .expect("the example should show a degradation block");
+
+    assert!(degradation.warn_multiple > 1.0);
+    assert!(degradation.critical_multiple > degradation.warn_multiple);
+    assert!(!degradation.absolute_ceiling.is_zero());
+    assert!(
+        degradation.recent_window < degradation.baseline_window,
+        "the recent window must leave room for a baseline"
+    );
+}
+
 #[test]
 fn a_missing_config_file_names_the_path_it_could_not_read() {
     let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("no-such-config.toml");
