@@ -133,6 +133,20 @@ pub fn render(assessment: &Assessment, now: SystemTime) -> Notification {
             now,
         ),
 
+        Reason::Stale {
+            stale_by,
+            data_ts,
+            warn_after,
+        } => render_stale(&subject, level, *stale_by, *data_ts, *warn_after, now),
+
+        Reason::FreshnessNeverReported {
+            watching_since,
+            waiting_for,
+            beats,
+        } => {
+            render_freshness_unreported(&subject, level, *watching_since, *waiting_for, *beats, now)
+        }
+
         Reason::CheckDown {
             failing_for,
             failed_probes,
@@ -279,6 +293,46 @@ fn render_no_work(
             )
         }
     }
+}
+
+fn render_stale(
+    subject: &str,
+    level: Level,
+    stale_by: Duration,
+    data_ts: SystemTime,
+    warn_after: Duration,
+    now: SystemTime,
+) -> String {
+    format!(
+        "{icon}  {subject} — acting on data {stale} old\n\
+         \x20   data timestamped {stamped}, expected fresher than {expected}\n\
+         \x20   the job itself is reporting in · this is the source, not the job\n\
+         \x20   → whatever it produced since then was computed from numbers this old",
+        icon = level.icon(),
+        stale = fmt::duration(stale_by),
+        stamped = fmt::timestamp(data_ts, now),
+        expected = fmt::duration(warn_after),
+    )
+}
+
+fn render_freshness_unreported(
+    subject: &str,
+    level: Level,
+    watching_since: SystemTime,
+    waiting_for: Duration,
+    beats: u64,
+    now: SystemTime,
+) -> String {
+    format!(
+        "{icon}  {subject} — freshness is configured but nothing is feeding it\n\
+         \x20   {beats} beats since {since} ({waited}), not one carrying data_ts\n\
+         \x20   nothing is stale · there is no data age to be stale, which is the problem\n\
+         \x20   → this job is not being watched for stale data at all; either send \
+         data_ts with the beat or drop the [job.freshness] block",
+        icon = level.icon(),
+        since = fmt::timestamp(watching_since, now),
+        waited = fmt::duration(waiting_for),
+    )
 }
 
 fn render_check_down(

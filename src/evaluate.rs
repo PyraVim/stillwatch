@@ -54,6 +54,25 @@ pub enum Reason {
         alive_and_quiet: bool,
     },
 
+    /// The data the job is acting on has gone stale.
+    Stale {
+        /// How old the data was, as of now.
+        stale_by: Duration,
+        data_ts: SystemTime,
+        warn_after: Duration,
+    },
+
+    /// The job declares a freshness rule but has never once sent `data_ts`.
+    ///
+    /// Not staleness — there is no data age to report. It is the rule itself
+    /// failing to apply, which looks exactly like health from outside and is
+    /// worth exactly one message.
+    FreshnessNeverReported {
+        watching_since: SystemTime,
+        waiting_for: Duration,
+        beats: u64,
+    },
+
     /// Every probe for at least `down_after` has failed.
     CheckDown {
         failing_for: Duration,
@@ -151,6 +170,8 @@ impl Eq for Trigger {}
 pub enum Condition {
     NoHeartbeat,
     NoWork,
+    Stale,
+    FreshnessUnreported,
     Down,
     Degraded,
     UntrustworthyBaseline,
@@ -164,6 +185,8 @@ impl Reason {
         match self {
             Reason::NoHeartbeat { .. } => "no heartbeat".to_string(),
             Reason::NoWork { .. } => "no work".to_string(),
+            Reason::Stale { .. } => "stale data".to_string(),
+            Reason::FreshnessNeverReported { .. } => "a freshness rule with no data".to_string(),
             Reason::CheckDown { .. } => "down".to_string(),
             Reason::Degraded { .. } => "degraded".to_string(),
             Reason::BaselineNotCredible { .. } => "an untrustworthy baseline".to_string(),
@@ -174,6 +197,8 @@ impl Reason {
         match self {
             Reason::NoHeartbeat { .. } => Condition::NoHeartbeat,
             Reason::NoWork { .. } => Condition::NoWork,
+            Reason::Stale { .. } => Condition::Stale,
+            Reason::FreshnessNeverReported { .. } => Condition::FreshnessUnreported,
             Reason::CheckDown { .. } => Condition::Down,
             Reason::Degraded { .. } => Condition::Degraded,
             Reason::BaselineNotCredible { .. } => Condition::UntrustworthyBaseline,
@@ -301,9 +326,71 @@ fn assess_job(job: &JobState, watch_started: SystemTime, now: SystemTime) -> Vec
     // rather than assumed.
     let alive_and_quiet = job.config.alive.is_some();
 
-    assess_worked(job, watch_started, now, alive_and_quiet)
-        .into_iter()
-        .collect()
+    let mut findings = Vec::new();
+    findings.extend(assess_worked(job, watch_started, now, alive_and_quiet));
+    findings.extend(assess_freshness(job, watch_started, now));
+    findings
+}
+
+/// How stale the data the job is acting on has become.
+///
+/// A job that has never sent `data_ts` is *not* fresh and is *not* stale — it is
+/// unjudged, and the only honest thing to do with an unjudged rule is say so.
+/// Reporting zero staleness for a job that never told us anything would be the
+/// most comfortable possible lie.
+fn assess_freshness(
+    job: &JobState,
+    watch_started: SystemTime,
+    now: SystemTime,
+) -> Option<Assessment> {
+    let freshness = job.config.freshness?;
+
+    let Some(data_ts) = job.last_data_ts else {
+        // Beats are arriving and none of them carries `data_ts`. The rule is
+        // configured, so somebody believes freshness is being watched, and it
+        // is not. That is worth exactly one message — but only once enough time
+        // has passed that data should plausibly have shown up, and only if the
+        // job is reporting at all. A job that has sent nothing whatsoever is
+        // the liveness signal's business, not this one's.
+        let waiting_for = now.duration_since(watch_started).unwrap_or(Duration::ZERO);
+        if job.beats > 0 && waiting_for >= freshness.warn_after {
+            return Some(Assessment {
+                subject: job.name().to_string(),
+                severity: Severity::Warn,
+                reason: Reason::FreshnessNeverReported {
+                    watching_since: watch_started,
+                    waiting_for,
+                    beats: job.beats,
+                },
+            });
+        }
+        return None;
+    };
+
+    // Data timestamped in the future means a clock disagreement, not data from
+    // the future.
+    let stale_by = now.duration_since(data_ts).unwrap_or(Duration::ZERO);
+
+    let severity = if freshness
+        .critical_after
+        .is_some_and(|critical_after| stale_by >= critical_after)
+    {
+        Severity::Critical
+    } else if stale_by >= freshness.warn_after {
+        Severity::Warn
+    } else {
+        return None;
+    };
+
+    Some(Assessment {
+        subject: job.name().to_string(),
+        severity,
+        reason: Reason::Stale {
+            stale_by,
+            data_ts,
+            warn_after: freshness.warn_after,
+        },
+    })
 }
 
 fn assess_worked(
@@ -1087,6 +1174,171 @@ mod tests {
         state.record_beat("nightly-sync", at(STARTED));
 
         assert!(evaluate(&state, at(STARTED + 365 * 24 * 3_600)).is_empty());
+    }
+
+    // -- freshness ---------------------------------------------------------
+
+    fn feed_with_freshness() -> JobConfig {
+        JobConfig {
+            freshness: Some(SilenceConfig {
+                warn_after: Duration::from_secs(600),
+                critical_after: Some(Duration::from_secs(1_800)),
+            }),
+            ..JobConfig::named("price-feed")
+        }
+    }
+
+    fn data_at(secs: u64) -> BeatDetail {
+        BeatDetail {
+            data_ts: Some(at(secs)),
+            ..BeatDetail::default()
+        }
+    }
+
+    /// A job that has never sent `data_ts` is not stale. It is unjudged, and
+    /// reporting zero staleness would be the most comfortable possible lie.
+    #[test]
+    fn a_job_that_has_never_sent_data_ts_is_not_reported_as_stale() {
+        let mut state = state(&[feed_with_freshness()]);
+        state.record_beat("price-feed", at(STARTED + 60));
+
+        let assessments = evaluate(&state, at(STARTED + 300));
+
+        assert!(
+            assessments.is_empty(),
+            "inside the grace window there is nothing to say: {assessments:?}"
+        );
+
+        // Past the threshold it is reported — but as a rule with no data, never
+        // as stale data.
+        let later = evaluate(&state, at(STARTED + 700));
+        assert_eq!(later.len(), 1);
+        assert!(
+            matches!(later[0].reason, Reason::FreshnessNeverReported { .. }),
+            "got {:?}",
+            later[0].reason
+        );
+        assert!(!matches!(later[0].reason, Reason::Stale { .. }));
+    }
+
+    #[test]
+    fn a_freshness_rule_with_no_data_names_the_beats_that_arrived_without_it() {
+        let mut state = state(&[feed_with_freshness()]);
+        for tick in 1..=42 {
+            state.record_beat("price-feed", at(STARTED + tick * 10));
+        }
+
+        let now = at(STARTED + 700);
+        let text = crate::notify::render(&evaluate(&state, now)[0], now).text;
+
+        assert!(text.contains("42 beats"), "{text}");
+        assert!(text.contains("not one carrying data_ts"), "{text}");
+        assert!(
+            text.contains("nothing is stale"),
+            "it must not imply staleness it cannot measure: {text}"
+        );
+    }
+
+    /// A job that has sent nothing at all is the liveness signal's business.
+    /// Freshness has no opinion on it.
+    #[test]
+    fn a_job_with_no_beats_at_all_produces_no_freshness_finding() {
+        let state = state(&[feed_with_freshness()]);
+        assert!(evaluate(&state, at(STARTED + 10_000)).is_empty());
+    }
+
+    #[test]
+    fn data_older_than_warn_after_is_stale() {
+        let mut state = state(&[feed_with_freshness()]);
+        state.record_beat_with("price-feed", at(STARTED + 60), &data_at(STARTED));
+
+        assert!(evaluate(&state, at(STARTED + 599)).is_empty());
+
+        let assessments = evaluate(&state, at(STARTED + 600));
+        assert_eq!(assessments.len(), 1);
+        assert_eq!(assessments[0].severity, Severity::Warn);
+
+        let Reason::Stale { stale_by, .. } = &assessments[0].reason else {
+            panic!("expected a stale reason")
+        };
+        assert_eq!(*stale_by, Duration::from_secs(600));
+    }
+
+    #[test]
+    fn data_older_than_critical_after_is_critical() {
+        let mut state = state(&[feed_with_freshness()]);
+        state.record_beat_with("price-feed", at(STARTED + 60), &data_at(STARTED));
+
+        let assessments = evaluate(&state, at(STARTED + 1_800));
+        assert_eq!(assessments[0].severity, Severity::Critical);
+    }
+
+    /// Staleness is measured from the data's own timestamp, not from when the
+    /// beat carrying it arrived. A job reporting punctually about old data is
+    /// exactly the failure this catches.
+    #[test]
+    fn freshness_follows_the_data_not_the_beat() {
+        let mut state = state(&[feed_with_freshness()]);
+
+        // Beating every minute, but the data has been frozen since STARTED.
+        for minute in 1..=20 {
+            state.record_beat_with("price-feed", at(STARTED + minute * 60), &data_at(STARTED));
+        }
+
+        let assessments = evaluate(&state, at(STARTED + 1_200));
+        assert_eq!(assessments.len(), 1);
+        assert!(matches!(assessments[0].reason, Reason::Stale { .. }));
+    }
+
+    #[test]
+    fn fresh_data_arriving_clears_the_staleness() {
+        let mut state = state(&[feed_with_freshness()]);
+        state.record_beat_with("price-feed", at(STARTED + 60), &data_at(STARTED));
+        assert!(!evaluate(&state, at(STARTED + 700)).is_empty());
+
+        state.record_beat_with("price-feed", at(STARTED + 700), &data_at(STARTED + 690));
+        assert!(evaluate(&state, at(STARTED + 700)).is_empty());
+    }
+
+    #[test]
+    fn a_clock_disagreement_does_not_make_data_stale() {
+        let mut state = state(&[feed_with_freshness()]);
+        // Data timestamped in the future.
+        state.record_beat_with("price-feed", at(STARTED + 60), &data_at(STARTED + 9_000));
+
+        assert!(evaluate(&state, at(STARTED + 100)).is_empty());
+    }
+
+    #[test]
+    fn a_job_with_no_freshness_block_is_never_judged_on_data_age() {
+        let mut state = state(&[nightly()]);
+        state.record_beat_with("nightly-sync", at(STARTED), &data_at(STARTED));
+
+        assert!(evaluate(&state, at(STARTED + 365 * 24 * 3_600)).is_empty());
+    }
+
+    /// Freshness and work are separate findings about a live job, and both
+    /// deserve saying.
+    #[test]
+    fn stale_data_and_no_work_are_reported_as_two_findings() {
+        let mut state = state(&[JobConfig {
+            worked: Some(SilenceConfig {
+                warn_after: Duration::from_secs(600),
+                critical_after: None,
+            }),
+            freshness: Some(SilenceConfig {
+                warn_after: Duration::from_secs(600),
+                critical_after: None,
+            }),
+            ..JobConfig::named("price-feed")
+        }]);
+
+        state.record_beat_with("price-feed", at(STARTED + 60), &data_at(STARTED));
+
+        let assessments = evaluate(&state, at(STARTED + 700));
+        let conditions: Vec<_> = assessments.iter().map(|a| a.reason.condition()).collect();
+
+        assert_eq!(conditions, [Condition::NoWork, Condition::Stale]);
     }
 
     // -- checks: fixtures --------------------------------------------------
