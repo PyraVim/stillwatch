@@ -12,12 +12,13 @@
 //! textually would let a secret containing a quote or a newline rewrite the
 //! surrounding TOML.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::fmt;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use reqwest::Url;
 use serde::{Deserialize, Deserializer};
 use toml::Value;
 
@@ -34,6 +35,21 @@ const WARN_MULTIPLE: u32 = 5;
 
 /// `critical_after` defaults to this many times `expect_every`.
 const CRITICAL_MULTIPLE: u32 = 15;
+
+/// How often a dependency is probed when the check does not say.
+const DEFAULT_CHECK_INTERVAL: Duration = Duration::from_secs(30);
+
+/// How long a single probe may take when the check does not say.
+const DEFAULT_CHECK_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// `down_after` defaults to this many intervals of unbroken failure.
+const DOWN_AFTER_INTERVALS: u32 = 2;
+
+/// Observations needed before a baseline is trusted, when not configured.
+const DEFAULT_MIN_SAMPLES: usize = 30;
+
+/// "Current" latency is the last this many probes.
+const RECENT_INTERVALS: u32 = 20;
 
 /// Scalar config paths that a `STILLWATCH_*` environment variable may override.
 ///
@@ -104,14 +120,31 @@ pub enum ConfigError {
         source: std::net::AddrParseError,
     },
 
-    #[error("two jobs are both named {name:?}; job names must be unique")]
-    DuplicateJob { name: String },
+    /// Jobs and checks share one namespace: both become the subject line of an
+    /// alert, and the notifier deduplicates on that subject. Two subjects with
+    /// the same name would silently suppress each other's alerts.
+    #[error("{name:?} is used as the name of more than one job or check; names must be unique")]
+    DuplicateSubject { name: String },
 
     #[error("job name {name:?} is not usable: {reason}")]
     InvalidJobName { name: String, reason: &'static str },
 
     #[error("job {job:?}: {message}")]
     InvalidThreshold { job: String, message: String },
+
+    #[error("check {check:?} has type {kind:?}, which is not one of \"http\" or \"jsonrpc\"")]
+    UnknownCheckType { check: String, kind: String },
+
+    #[error("check {check:?}: url {url:?} could not be parsed")]
+    InvalidCheckUrl {
+        check: String,
+        url: String,
+        #[source]
+        source: url::ParseError,
+    },
+
+    #[error("check {check:?}: {message}")]
+    InvalidCheck { check: String, message: String },
 }
 
 // ---------------------------------------------------------------------------
@@ -124,6 +157,7 @@ pub struct Config {
     pub listen: SocketAddr,
     pub telegram: Option<TelegramConfig>,
     pub jobs: Vec<JobConfig>,
+    pub checks: Vec<CheckConfig>,
 }
 
 #[derive(Clone)]
@@ -157,6 +191,73 @@ pub struct AliveConfig {
     pub expect_every: Duration,
     pub warn_after: Duration,
     pub critical_after: Duration,
+}
+
+/// A dependency probed directly, on its own schedule.
+#[derive(Debug, Clone)]
+pub struct CheckConfig {
+    pub name: String,
+    pub probe: ProbeConfig,
+    pub interval: Duration,
+    pub timeout: Duration,
+
+    /// How long every probe must have been failing before the check is called
+    /// down. Defaults to two intervals, so one blip is not a page.
+    pub down_after: Duration,
+
+    /// `None` when the check declares no `[check.degradation]` block, in which
+    /// case it is watched for up/down only and never judged on latency.
+    pub degradation: Option<DegradationConfig>,
+}
+
+#[derive(Debug, Clone)]
+pub enum ProbeConfig {
+    Http { url: Url },
+    JsonRpc { url: Url, method: String },
+}
+
+impl ProbeConfig {
+    pub fn url(&self) -> &Url {
+        match self {
+            ProbeConfig::Http { url } | ProbeConfig::JsonRpc { url, .. } => url,
+        }
+    }
+
+    pub fn kind(&self) -> &'static str {
+        match self {
+            ProbeConfig::Http { .. } => "http",
+            ProbeConfig::JsonRpc { .. } => "jsonrpc",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct DegradationConfig {
+    /// The span the baseline is drawn from. The most recent `recent_window` is
+    /// excluded from it, so a slowdown that is still happening does not get to
+    /// teach the baseline that it is normal.
+    pub baseline_window: Duration,
+
+    /// The span "current" latency is measured over. Derived, not configured:
+    /// twenty probes' worth, capped at a third of the baseline window.
+    pub recent_window: Duration,
+
+    pub warn_multiple: f64,
+    pub critical_multiple: f64,
+
+    /// Latency that is unacceptable no matter what the baseline has learned.
+    ///
+    /// This is the only thing standing between a poisoned baseline and silence.
+    /// If stillwatch starts while a dependency is already slow, the baseline
+    /// learns that slow is normal and the multiples will never fire — so the
+    /// ceiling is evaluated independently of the baseline, and before any
+    /// baseline exists at all. Set it to what you actually consider
+    /// unacceptable, not to some extreme.
+    pub absolute_ceiling: Duration,
+
+    /// Observations needed before the baseline is trusted enough to judge
+    /// anything.
+    pub min_samples: usize,
 }
 
 impl Config {
@@ -318,6 +419,43 @@ fn warn_unrecognized(root: &toml::Table) {
                     }
                 }
             }
+            "check" => {
+                let Some(checks) = value.as_array() else {
+                    continue;
+                };
+                for (index, check) in checks.iter().enumerate() {
+                    let path = format!("check[{index}]");
+                    warn_children(
+                        check,
+                        &path,
+                        &[
+                            "name",
+                            "type",
+                            "url",
+                            "method",
+                            "interval",
+                            "timeout",
+                            "down_after",
+                            "degradation",
+                        ],
+                        |_| {},
+                    );
+                    if let Some(degradation) = check.get("degradation") {
+                        warn_children(
+                            degradation,
+                            &format!("{path}.degradation"),
+                            &[
+                                "baseline_window",
+                                "warn_multiple",
+                                "critical_multiple",
+                                "absolute_ceiling",
+                                "min_samples",
+                            ],
+                            |_| {},
+                        );
+                    }
+                }
+            }
             other => unrecognized(other),
         }
     }
@@ -354,6 +492,8 @@ struct RawConfig {
     notify: Option<RawNotify>,
     #[serde(default, rename = "job")]
     jobs: Vec<RawJob>,
+    #[serde(default, rename = "check")]
+    checks: Vec<RawCheck>,
 }
 
 #[derive(Deserialize)]
@@ -382,6 +522,33 @@ struct RawAlive {
     warn_after: Option<Duration>,
     #[serde(default, with = "humantime_serde")]
     critical_after: Option<Duration>,
+}
+
+#[derive(Deserialize)]
+struct RawCheck {
+    name: String,
+    #[serde(rename = "type")]
+    kind: Option<String>,
+    url: String,
+    method: Option<String>,
+    #[serde(default, with = "humantime_serde")]
+    interval: Option<Duration>,
+    #[serde(default, with = "humantime_serde")]
+    timeout: Option<Duration>,
+    #[serde(default, with = "humantime_serde")]
+    down_after: Option<Duration>,
+    degradation: Option<RawDegradation>,
+}
+
+#[derive(Deserialize)]
+struct RawDegradation {
+    #[serde(with = "humantime_serde")]
+    baseline_window: Duration,
+    warn_multiple: f64,
+    critical_multiple: f64,
+    #[serde(with = "humantime_serde")]
+    absolute_ceiling: Duration,
+    min_samples: Option<usize>,
 }
 
 /// Telegram chat ids are often written unquoted (`chat_id = -1001234567890`).
@@ -418,22 +585,198 @@ impl RawConfig {
                 chat_id: t.chat_id,
             });
 
+        // Jobs and checks share one subject namespace, so uniqueness is checked
+        // across both rather than within each.
+        let mut subjects = BTreeSet::new();
+        let mut claim = |name: &str| -> Result<(), ConfigError> {
+            if subjects.insert(name.to_string()) {
+                Ok(())
+            } else {
+                Err(ConfigError::DuplicateSubject {
+                    name: name.to_string(),
+                })
+            }
+        };
+
         let mut jobs = Vec::with_capacity(self.jobs.len());
         for raw in self.jobs {
             let job = raw.resolve()?;
-            if jobs
-                .iter()
-                .any(|existing: &JobConfig| existing.name == job.name)
-            {
-                return Err(ConfigError::DuplicateJob { name: job.name });
-            }
+            claim(&job.name)?;
             jobs.push(job);
+        }
+
+        let mut checks = Vec::with_capacity(self.checks.len());
+        for raw in self.checks {
+            let check = raw.resolve()?;
+            claim(&check.name)?;
+            checks.push(check);
         }
 
         Ok(Config {
             listen,
             telegram,
             jobs,
+            checks,
+        })
+    }
+}
+
+impl RawCheck {
+    fn resolve(self) -> Result<CheckConfig, ConfigError> {
+        let name = self.name;
+        validate_subject_name(&name).map_err(|reason| ConfigError::InvalidCheck {
+            check: name.clone(),
+            message: format!("the name is not usable: {reason}"),
+        })?;
+
+        let invalid = |message: String| ConfigError::InvalidCheck {
+            check: name.clone(),
+            message,
+        };
+
+        let url = Url::parse(&self.url).map_err(|source| ConfigError::InvalidCheckUrl {
+            check: name.clone(),
+            url: self.url.clone(),
+            source,
+        })?;
+
+        let kind = self.kind.as_deref().unwrap_or("http");
+        let probe = match kind {
+            "http" => {
+                if self.method.is_some() {
+                    return Err(invalid(
+                        "`method` only means something for a jsonrpc check".to_string(),
+                    ));
+                }
+                ProbeConfig::Http { url }
+            }
+            "jsonrpc" => {
+                let method = self.method.clone().ok_or_else(|| {
+                    invalid("a jsonrpc check needs a `method` to call".to_string())
+                })?;
+                ProbeConfig::JsonRpc { url, method }
+            }
+            other => {
+                return Err(ConfigError::UnknownCheckType {
+                    check: name,
+                    kind: other.to_string(),
+                })
+            }
+        };
+
+        let interval = self.interval.unwrap_or(DEFAULT_CHECK_INTERVAL);
+        if interval.is_zero() {
+            return Err(invalid("interval must be greater than zero".to_string()));
+        }
+
+        let timeout = self.timeout.unwrap_or(DEFAULT_CHECK_TIMEOUT);
+        if timeout.is_zero() {
+            return Err(invalid("timeout must be greater than zero".to_string()));
+        }
+        // A probe allowed to outlast its own interval overlaps itself, and the
+        // latency samples stop meaning what they claim to mean.
+        if timeout >= interval {
+            return Err(invalid(format!(
+                "timeout ({}) must be shorter than interval ({})",
+                crate::fmt::duration(timeout),
+                crate::fmt::duration(interval),
+            )));
+        }
+
+        let down_after = self.down_after.unwrap_or(interval * DOWN_AFTER_INTERVALS);
+        if down_after < interval {
+            return Err(invalid(format!(
+                "down_after ({}) is shorter than interval ({}), so it could fire before \
+                 a single probe has had the chance to run",
+                crate::fmt::duration(down_after),
+                crate::fmt::duration(interval),
+            )));
+        }
+
+        let degradation = self
+            .degradation
+            .map(|raw| raw.resolve(&name, interval))
+            .transpose()?;
+
+        Ok(CheckConfig {
+            name,
+            probe,
+            interval,
+            timeout,
+            down_after,
+            degradation,
+        })
+    }
+}
+
+impl RawDegradation {
+    fn resolve(self, check: &str, interval: Duration) -> Result<DegradationConfig, ConfigError> {
+        let invalid = |message: String| ConfigError::InvalidCheck {
+            check: check.to_string(),
+            message,
+        };
+
+        if self.baseline_window.is_zero() {
+            return Err(invalid(
+                "degradation.baseline_window must be greater than zero".to_string(),
+            ));
+        }
+        if self.absolute_ceiling.is_zero() {
+            return Err(invalid(
+                "degradation.absolute_ceiling must be greater than zero".to_string(),
+            ));
+        }
+        if !(self.warn_multiple.is_finite() && self.warn_multiple > 1.0) {
+            return Err(invalid(format!(
+                "degradation.warn_multiple ({}) must be greater than 1.0, or it would fire \
+                 at or below the baseline itself",
+                self.warn_multiple
+            )));
+        }
+        if !(self.critical_multiple.is_finite() && self.critical_multiple > self.warn_multiple) {
+            return Err(invalid(format!(
+                "degradation.critical_multiple ({}) must be greater than warn_multiple ({})",
+                self.critical_multiple, self.warn_multiple
+            )));
+        }
+
+        // Current latency is the last twenty probes, but never more than a third
+        // of the window — otherwise there would be little left to form a
+        // baseline from.
+        let recent_window = (interval * RECENT_INTERVALS).min(self.baseline_window / 3);
+        let baseline_span = self.baseline_window.saturating_sub(recent_window);
+
+        let min_samples = self.min_samples.unwrap_or(DEFAULT_MIN_SAMPLES);
+        if min_samples == 0 {
+            return Err(invalid(
+                "degradation.min_samples must be at least 1; a baseline drawn from no \
+                 observations is not a baseline"
+                    .to_string(),
+            ));
+        }
+
+        // A check that could never accumulate enough samples would sit in
+        // "warming up" forever, judging nothing — and the whole point of the
+        // warming state is that nobody should have to guess whether a check is
+        // being judged. That is a config error, and it is discoverable here.
+        let capacity = (baseline_span.as_secs_f64() / interval.as_secs_f64()).floor() as usize;
+        if capacity < min_samples {
+            return Err(invalid(format!(
+                "degradation.baseline_window ({}) leaves room for at most {capacity} \
+                 baseline probes at interval {}, fewer than min_samples ({min_samples}); \
+                 this check would never finish warming up",
+                crate::fmt::duration(self.baseline_window),
+                crate::fmt::duration(interval),
+            )));
+        }
+
+        Ok(DegradationConfig {
+            baseline_window: self.baseline_window,
+            recent_window,
+            warn_multiple: self.warn_multiple,
+            critical_multiple: self.critical_multiple,
+            absolute_ceiling: self.absolute_ceiling,
+            min_samples,
         })
     }
 }
@@ -449,28 +792,28 @@ impl RawJob {
     }
 }
 
-/// The job name is a path segment in `POST /beat/{job}` and the subject line of
-/// every alert about it, so it has to survive both.
-fn validate_job_name(name: &str) -> Result<(), ConfigError> {
-    let reason = if name.is_empty() {
-        Some("it is empty")
+/// A job name is a path segment in `POST /beat/{job}`; every subject name is the
+/// lead line of an alert and the key the notifier deduplicates on. Names have to
+/// survive all of that.
+fn validate_subject_name(name: &str) -> Result<(), &'static str> {
+    if name.is_empty() {
+        Err("it is empty")
     } else if name.contains('/') {
-        Some("it contains '/', which cannot appear in the /beat/{job} path")
+        Err("it contains '/', which cannot appear in the /beat/{job} path")
     } else if name.chars().any(char::is_whitespace) {
-        Some("it contains whitespace")
+        Err("it contains whitespace")
     } else if name.chars().any(char::is_control) {
-        Some("it contains a control character")
+        Err("it contains a control character")
     } else {
-        None
-    };
-
-    match reason {
-        Some(reason) => Err(ConfigError::InvalidJobName {
-            name: name.to_string(),
-            reason,
-        }),
-        None => Ok(()),
+        Ok(())
     }
+}
+
+fn validate_job_name(name: &str) -> Result<(), ConfigError> {
+    validate_subject_name(name).map_err(|reason| ConfigError::InvalidJobName {
+        name: name.to_string(),
+        reason,
+    })
 }
 
 impl RawAlive {
@@ -786,7 +1129,28 @@ name = "nightly-sync"
         )
         .expect_err("should fail");
 
-        assert!(matches!(&err, ConfigError::DuplicateJob { name } if name == "nightly-sync"));
+        assert!(matches!(&err, ConfigError::DuplicateSubject { name } if name == "nightly-sync"));
+    }
+
+    /// Jobs and checks both become alert subjects, and the notifier dedups on
+    /// the subject — so a job and a check sharing a name would silently
+    /// suppress each other's alerts.
+    #[test]
+    fn a_job_and_a_check_may_not_share_a_name() {
+        let err = Config::from_toml(
+            r#"
+[[job]]
+name = "vendor-api"
+
+[[check]]
+name = "vendor-api"
+url  = "https://api.vendor.com/health"
+"#,
+            &no_env(),
+        )
+        .expect_err("should fail");
+
+        assert!(matches!(&err, ConfigError::DuplicateSubject { name } if name == "vendor-api"));
     }
 
     #[test]
@@ -879,6 +1243,233 @@ url = "https://api.vendor.com/health"
 
         assert_eq!(config.jobs.len(), 1);
         assert!(config.jobs[0].alive.is_some());
+    }
+
+    // -- checks ------------------------------------------------------------
+
+    fn one_check(body: &str) -> Result<CheckConfig, ConfigError> {
+        let text = format!("[[check]]\n{body}\n");
+        Config::from_toml(&text, &no_env()).map(|mut c| c.checks.remove(0))
+    }
+
+    #[test]
+    fn a_minimal_check_gets_sensible_defaults() {
+        let check = one_check(
+            r#"
+name = "vendor-api"
+url  = "https://api.vendor.com/health"
+"#,
+        )
+        .expect("check should load");
+
+        assert_eq!(check.interval, Duration::from_secs(30));
+        assert_eq!(check.timeout, Duration::from_secs(5));
+        assert_eq!(check.down_after, Duration::from_secs(60), "two intervals");
+        assert!(
+            check.degradation.is_none(),
+            "no [check.degradation] block means up/down only, never a latency verdict"
+        );
+        assert_eq!(check.probe.kind(), "http");
+    }
+
+    #[test]
+    fn the_spec_example_check_resolves() {
+        let check = one_check(
+            r#"
+name     = "vendor-api"
+type     = "http"
+url      = "https://api.vendor.com/health"
+interval = "30s"
+timeout  = "3s"
+
+  [check.degradation]
+  baseline_window   = "1h"
+  warn_multiple     = 3.0
+  critical_multiple = 8.0
+  absolute_ceiling  = "2s"
+"#,
+        )
+        .expect("check should load");
+
+        let degradation = check.degradation.expect("degradation");
+        assert_eq!(degradation.baseline_window, Duration::from_secs(3_600));
+        assert_eq!(degradation.absolute_ceiling, Duration::from_secs(2));
+        assert_eq!(degradation.min_samples, 30);
+        // Twenty probes at 30s, which is under a third of the hour.
+        assert_eq!(degradation.recent_window, Duration::from_secs(600));
+    }
+
+    #[test]
+    fn the_recent_window_never_eats_more_than_a_third_of_the_baseline() {
+        let check = one_check(
+            r#"
+name     = "slow-rpc"
+url      = "https://rpc.example.com"
+interval = "60s"
+
+  [check.degradation]
+  baseline_window   = "30m"
+  warn_multiple     = 3.0
+  critical_multiple = 8.0
+  absolute_ceiling  = "2s"
+  min_samples       = 10
+"#,
+        )
+        .expect("check should load");
+
+        let degradation = check.degradation.expect("degradation");
+        // 20 x 60s = 20m would be two thirds of the window, so it is capped.
+        assert_eq!(degradation.recent_window, Duration::from_secs(600));
+    }
+
+    #[test]
+    fn a_jsonrpc_check_needs_a_method() {
+        let err = one_check(
+            r#"
+name = "chain-rpc"
+type = "jsonrpc"
+url  = "https://rpc.example.com"
+"#,
+        )
+        .expect_err("should fail");
+
+        assert!(err.to_string().contains("method"), "{err}");
+    }
+
+    #[test]
+    fn a_jsonrpc_check_with_a_method_resolves() {
+        let check = one_check(
+            r#"
+name   = "chain-rpc"
+type   = "jsonrpc"
+url    = "https://rpc.example.com"
+method = "eth_blockNumber"
+"#,
+        )
+        .expect("check should load");
+
+        assert_eq!(check.probe.kind(), "jsonrpc");
+        assert!(matches!(
+            &check.probe,
+            ProbeConfig::JsonRpc { method, .. } if method == "eth_blockNumber"
+        ));
+    }
+
+    #[test]
+    fn a_method_on_an_http_check_is_rejected_rather_than_ignored() {
+        let err = one_check(
+            r#"
+name   = "vendor-api"
+url    = "https://api.vendor.com/health"
+method = "eth_blockNumber"
+"#,
+        )
+        .expect_err("should fail");
+
+        assert!(err.to_string().contains("jsonrpc"), "{err}");
+    }
+
+    #[test]
+    fn an_unknown_check_type_is_rejected() {
+        let err = one_check(
+            r#"
+name = "vendor-api"
+type = "grpc"
+url  = "https://api.vendor.com/health"
+"#,
+        )
+        .expect_err("should fail");
+
+        assert!(matches!(&err, ConfigError::UnknownCheckType { kind, .. } if kind == "grpc"));
+    }
+
+    #[test]
+    fn an_unparseable_url_is_a_startup_error() {
+        let err = one_check(
+            r#"
+name = "vendor-api"
+url  = "not a url"
+"#,
+        )
+        .expect_err("should fail");
+
+        assert!(matches!(err, ConfigError::InvalidCheckUrl { .. }));
+    }
+
+    #[test]
+    fn a_timeout_longer_than_the_interval_is_rejected() {
+        let err = one_check(
+            r#"
+name     = "vendor-api"
+url      = "https://api.vendor.com/health"
+interval = "5s"
+timeout  = "10s"
+"#,
+        )
+        .expect_err("should fail");
+
+        assert!(err.to_string().contains("timeout"), "{err}");
+    }
+
+    /// A check whose window cannot physically hold `min_samples` would sit in
+    /// "warming up" forever, judging nothing and quietly looking fine. That is
+    /// the cold-start failure, and it is catchable at startup.
+    #[test]
+    fn a_baseline_window_too_short_to_ever_warm_up_is_rejected() {
+        let err = one_check(
+            r#"
+name     = "vendor-api"
+url      = "https://api.vendor.com/health"
+interval = "30s"
+
+  [check.degradation]
+  baseline_window   = "5m"
+  warn_multiple     = 3.0
+  critical_multiple = 8.0
+  absolute_ceiling  = "2s"
+"#,
+        )
+        .expect_err("should fail");
+
+        assert!(err.to_string().contains("never finish warming up"), "{err}");
+        assert!(err.to_string().contains("min_samples"), "{err}");
+    }
+
+    #[test]
+    fn multiples_must_be_ordered_and_above_one() {
+        let too_small = one_check(
+            r#"
+name = "vendor-api"
+url  = "https://api.vendor.com/health"
+  [check.degradation]
+  baseline_window   = "1h"
+  warn_multiple     = 1.0
+  critical_multiple = 8.0
+  absolute_ceiling  = "2s"
+"#,
+        )
+        .expect_err("should fail");
+        assert!(
+            too_small.to_string().contains("warn_multiple"),
+            "{too_small}"
+        );
+
+        let inverted = one_check(
+            r#"
+name = "vendor-api"
+url  = "https://api.vendor.com/health"
+  [check.degradation]
+  baseline_window   = "1h"
+  warn_multiple     = 8.0
+  critical_multiple = 3.0
+  absolute_ceiling  = "2s"
+"#,
+        )
+        .expect_err("should fail");
+        assert!(
+            inverted.to_string().contains("critical_multiple"),
+            "{inverted}"
+        );
     }
 
     #[test]
