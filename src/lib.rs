@@ -7,5 +7,6 @@ pub mod config;
 pub mod evaluate;
 pub mod fmt;
 pub mod notify;
+pub mod prober;
 pub mod receiver;
 pub mod state;
