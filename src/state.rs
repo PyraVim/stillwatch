@@ -23,6 +23,36 @@ pub struct State {
 
     /// Keyed by check name, ordered for the same reason.
     checks: BTreeMap<String, CheckState>,
+
+    /// Unpruned history of everything observed. `None` outside `learn` mode,
+    /// so the daemon pays nothing for it.
+    ///
+    /// Deliberately fed by the same `record_*` calls as the live state rather
+    /// than by a parallel observation path. Thresholds derived from a different
+    /// view of reality than the one the evaluator later judges against would
+    /// disagree with it in ways nobody would find for months.
+    journal: Option<Journal>,
+}
+
+/// Everything observed during a `learn` run, kept in full.
+#[derive(Debug, Default, Clone)]
+pub struct Journal {
+    pub jobs: BTreeMap<String, JobHistory>,
+    pub checks: BTreeMap<String, Vec<Observation>>,
+}
+
+#[derive(Debug, Default, Clone)]
+pub struct JobHistory {
+    /// When each beat arrived.
+    pub beats: Vec<SystemTime>,
+
+    /// When each beat reporting `worked: true` arrived.
+    pub worked: Vec<SystemTime>,
+
+    /// `(when the beat arrived, the data_ts it carried)`.
+    pub data: Vec<(SystemTime, SystemTime)>,
+
+    pub counters: Vec<CounterSample>,
 }
 
 #[derive(Debug, Clone)]
@@ -324,7 +354,21 @@ impl State {
             started_at,
             jobs,
             checks,
+            journal: None,
         }
+    }
+
+    /// Records everything observed, unpruned, for `learn` to derive from.
+    ///
+    /// Only `learn` turns this on: the daemon is meant to run for months and
+    /// keeping every beat forever is how a watchdog becomes the thing that
+    /// falls over.
+    pub fn start_journal(&mut self) {
+        self.journal = Some(Journal::default());
+    }
+
+    pub fn journal(&self) -> Option<&Journal> {
+        self.journal.as_ref()
     }
 
     pub fn started_at(&self) -> SystemTime {
@@ -342,13 +386,29 @@ impl State {
 
     /// Records a beat carrying optional detail. Returns `false` for an unknown job.
     pub fn record_beat_with(&mut self, job: &str, at: SystemTime, detail: &BeatDetail) -> bool {
-        match self.jobs.get_mut(job) {
-            Some(state) => {
-                state.record(at, detail);
-                true
+        let Some(state) = self.jobs.get_mut(job) else {
+            return false;
+        };
+        state.record(at, detail);
+
+        if let Some(journal) = &mut self.journal {
+            let history = journal.jobs.entry(job.to_string()).or_default();
+            history.beats.push(at);
+            if detail.worked == Some(true) {
+                history.worked.push(at);
             }
-            None => false,
+            if let Some(data_ts) = detail.data_ts {
+                history.data.push((at, data_ts));
+            }
+            if !detail.counters.is_empty() {
+                history.counters.push(CounterSample {
+                    at,
+                    counters: detail.counters.clone(),
+                });
+            }
         }
+
+        true
     }
 
     pub fn job(&self, name: &str) -> Option<&JobState> {
@@ -361,13 +421,20 @@ impl State {
 
     /// Records a probe result. Returns `false` if no check by that name exists.
     pub fn record_probe(&mut self, check: &str, observation: Observation) -> bool {
-        match self.checks.get_mut(check) {
-            Some(state) => {
-                state.record(observation);
-                true
-            }
-            None => false,
+        let Some(state) = self.checks.get_mut(check) else {
+            return false;
+        };
+
+        if let Some(journal) = &mut self.journal {
+            journal
+                .checks
+                .entry(check.to_string())
+                .or_default()
+                .push(observation.clone());
         }
+
+        state.record(observation);
+        true
     }
 
     pub fn check(&self, name: &str) -> Option<&CheckState> {
@@ -402,6 +469,11 @@ impl SharedState {
     /// Records a probe result. Returns `false` if no check by that name exists.
     pub fn record_probe(&self, check: &str, observation: Observation) -> bool {
         self.lock().record_probe(check, observation)
+    }
+
+    /// Turns on unpruned recording for `learn`.
+    pub fn start_journal(&self) {
+        self.lock().start_journal();
     }
 
     /// Runs `f` against the state while holding the lock.
@@ -633,6 +705,95 @@ mod tests {
             None,
             "an empty sample is not zero latency"
         );
+    }
+
+    // -- the learn journal -------------------------------------------------
+
+    #[test]
+    fn nothing_is_journalled_unless_learning() {
+        let mut state = State::new(at(1_000), &jobs(), &[]);
+        state.record_beat("product-scraper", at(1_060));
+
+        assert!(
+            state.journal().is_none(),
+            "the daemon pays nothing for learn"
+        );
+    }
+
+    #[test]
+    fn a_journal_keeps_every_beat_rather_than_only_the_last() {
+        let mut state = State::new(at(1_000), &jobs(), &[]);
+        state.start_journal();
+
+        for tick in 0..5 {
+            state.record_beat("product-scraper", at(1_000 + tick * 60));
+        }
+
+        let history = &state.journal().expect("journal").jobs["product-scraper"];
+        assert_eq!(history.beats.len(), 5);
+        assert_eq!(history.beats[0], at(1_000));
+        assert_eq!(history.beats[4], at(1_240));
+    }
+
+    #[test]
+    fn a_journal_separates_beats_from_work_and_data() {
+        let mut state = State::new(at(1_000), &jobs(), &[]);
+        state.start_journal();
+
+        state.record_beat("product-scraper", at(1_060));
+        state.record_beat_with(
+            "product-scraper",
+            at(1_120),
+            &BeatDetail {
+                worked: Some(true),
+                data_ts: Some(at(1_100)),
+                counters: BTreeMap::from([("fetched".to_string(), 12.0)]),
+            },
+        );
+
+        let history = &state.journal().expect("journal").jobs["product-scraper"];
+        assert_eq!(history.beats.len(), 2);
+        assert_eq!(history.worked, [at(1_120)], "a bare beat is not work");
+        assert_eq!(history.data, [(at(1_120), at(1_100))]);
+        assert_eq!(history.counters.len(), 1);
+    }
+
+    /// The journal is fed by the same call the daemon uses, so what `learn`
+    /// derives from is exactly what the evaluator would later judge against.
+    #[test]
+    fn journalling_does_not_change_what_the_live_state_records() {
+        let mut plain = State::new(at(1_000), &jobs(), &[]);
+        let mut learning = State::new(at(1_000), &jobs(), &[]);
+        learning.start_journal();
+
+        for tick in 0..5 {
+            plain.record_beat("product-scraper", at(1_000 + tick * 60));
+            learning.record_beat("product-scraper", at(1_000 + tick * 60));
+        }
+
+        let plain_job = plain.job("product-scraper").expect("job");
+        let learning_job = learning.job("product-scraper").expect("job");
+        assert_eq!(plain_job.last_beat, learning_job.last_beat);
+        assert_eq!(plain_job.beats, learning_job.beats);
+    }
+
+    #[test]
+    fn a_journal_keeps_every_probe_unpruned() {
+        let mut state = State::new(at(0), &[], &[check_config(30, 600)]);
+        state.start_journal();
+
+        for tick in 0..500 {
+            state.record_probe("vendor-api", responded(tick * 30, 90));
+        }
+
+        let live = state.check("vendor-api").expect("check");
+        let journalled = &state.journal().expect("journal").checks["vendor-api"];
+
+        assert!(
+            live.observation_count() < 40,
+            "the live window still prunes"
+        );
+        assert_eq!(journalled.len(), 500, "the journal does not");
     }
 
     #[test]
