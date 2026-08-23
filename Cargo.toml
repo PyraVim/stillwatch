@@ -5,7 +5,7 @@ edition = "2021"
 rust-version = "1.85"
 license = "MIT"
 description = "A watchdog for processes that run unattended."
-repository = "https://github.com/cfletcher/stillwatch"
+repository = "https://github.com/PyraVim/stillwatch"
 readme = "README.md"
 
 # Versions are pinned exactly. A watchdog that silently changes behaviour on

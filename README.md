@@ -241,7 +241,7 @@ tool because you think you're covered.
 No published crate yet. Build it:
 
 ```bash
-git clone https://github.com/YOUR-USERNAME/stillwatch
+git clone https://github.com/PyraVim/stillwatch
 cd stillwatch
 cargo build --release
 ./target/release/stillwatch --config stillwatch.toml
