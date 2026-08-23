@@ -28,7 +28,7 @@ It catches the API that still returns 200 on every request and now takes 1.4s.
 Either way you get one message per incident, not one per evaluation cycle, and
 an all-clear with the duration when it ends.
 
-That's version 0.1. The rest of the plan is in [Roadmap](#roadmap), and none of
+That's version 0.2. The rest of the plan is in [Roadmap](#roadmap), and none of
 it is built yet.
 
 ---
