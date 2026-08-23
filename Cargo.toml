@@ -17,6 +17,7 @@ chrono = "=0.4.45"
 clap = { version = "=4.6.6", features = ["derive"] }
 humantime = "=2.4.0"
 humantime-serde = "=1.1.1"
+regex = "=1.13.1"
 reqwest = { version = "=0.13.4", features = ["json"] }
 serde = { version = "=1.0.229", features = ["derive"] }
 serde_json = "=1.0.151"
@@ -35,6 +36,18 @@ tracing-subscriber = { version = "=0.3.23", features = ["env-filter"] }
 # Named directly so a bad check url is a real typed error, not a string.
 url = "=2.5.8"
 
+# Passive mode needs one platform call apiece: "is this pid running" has no
+# portable answer in std.
+[target.'cfg(unix)'.dependencies]
+libc = "=0.2.189"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "=0.61.2", features = [
+    "Win32_Foundation",
+    "Win32_System_Threading",
+] }
+
 [dev-dependencies]
 http-body-util = "=0.1.5"
+tempfile = "=3.27.0"
 tower = { version = "=0.5.3", features = ["util"] }

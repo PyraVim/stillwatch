@@ -18,6 +18,7 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use regex::Regex;
 use reqwest::Url;
 use serde::{Deserialize, Deserializer};
 use toml::Value;
@@ -53,6 +54,9 @@ const RECENT_INTERVALS: u32 = 20;
 
 /// Denominator total a ratio rule needs before it is judged, when not configured.
 const DEFAULT_MIN_SAMPLE: u64 = 30;
+
+/// How long a watched process may be absent before that is reported.
+const DEFAULT_ABSENT_AFTER: Duration = Duration::from_secs(60);
 
 /// Scalar config paths that a `STILLWATCH_*` environment variable may override.
 ///
@@ -148,6 +152,14 @@ pub enum ConfigError {
 
     #[error("check {check:?}: {message}")]
     InvalidCheck { check: String, message: String },
+
+    #[error("job {job:?}: log.error_regex {pattern:?} is not a valid regular expression")]
+    InvalidRegex {
+        job: String,
+        pattern: String,
+        #[source]
+        source: Box<regex::Error>,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -198,6 +210,72 @@ pub struct JobConfig {
 
     /// Named counter ratios. Empty when the job declares none.
     pub ratios: Vec<RatioConfig>,
+
+    /// What the job is expected to do about reporting in.
+    pub mode: JobMode,
+
+    /// Watch a pidfile rather than waiting to be told.
+    pub process: Option<ProcessWatch>,
+
+    /// Watch whether a log is still moving, and whether it is saying anything bad.
+    pub log: Option<LogWatch>,
+
+    /// Watch whether the output is actually being produced.
+    pub artifact: Option<ArtifactWatch>,
+}
+
+/// Whether a job reports in, or is watched from outside.
+///
+/// Mostly a declaration of intent — the passive blocks work either way, and a
+/// job that both beats *and* has its output watched is a perfectly good idea.
+/// Declaring `passive` is what lets stillwatch catch the contradiction of a job
+/// that is not sending heartbeats being judged on missing them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum JobMode {
+    #[default]
+    Active,
+    Passive,
+}
+
+/// Is the process there at all?
+///
+/// The weakest of the three passive signals: a pidfile says a process with that
+/// id exists, not that it is doing anything, and not even reliably that it is
+/// *your* process. See the note on PID reuse in the README.
+#[derive(Debug, Clone)]
+pub struct ProcessWatch {
+    pub pidfile: PathBuf,
+
+    /// How long the process must be absent before that is reported.
+    ///
+    /// Defaults to a minute. Without it, an ordinary restart — during which the
+    /// pidfile is briefly gone — would page.
+    pub absent_after: Duration,
+}
+
+/// Is the log still moving, and is it saying anything bad?
+#[derive(Debug, Clone)]
+pub struct LogWatch {
+    pub path: PathBuf,
+
+    /// How long the file may go without growing before that is reported.
+    pub stale_after: Duration,
+
+    /// Lines matching this are reported as errors the job itself logged.
+    pub error_regex: Option<Regex>,
+}
+
+/// Is the output actually being produced?
+#[derive(Debug, Clone)]
+pub struct ArtifactWatch {
+    pub path: PathBuf,
+
+    /// How old the file may be before that is reported.
+    pub stale_after: Duration,
+
+    /// A file smaller than this does not count as produced. An empty export is
+    /// the classic "ran, exited zero, wrote nothing" outcome.
+    pub min_bytes: u64,
 }
 
 impl JobConfig {
@@ -212,7 +290,16 @@ impl JobConfig {
             worked: None,
             freshness: None,
             ratios: Vec::new(),
+            mode: JobMode::Active,
+            process: None,
+            log: None,
+            artifact: None,
         }
+    }
+
+    /// Whether this job is watched from outside rather than reporting in.
+    pub fn is_passive(&self) -> bool {
+        self.process.is_some() || self.log.is_some() || self.artifact.is_some()
     }
 }
 
@@ -485,9 +572,28 @@ fn warn_unrecognized(root: &toml::Table) {
                     warn_children(
                         job,
                         &path,
-                        &["name", "alive", "worked", "freshness", "ratio"],
+                        &[
+                            "name",
+                            "mode",
+                            "alive",
+                            "worked",
+                            "freshness",
+                            "ratio",
+                            "process",
+                            "log",
+                            "artifact",
+                        ],
                         |_| {},
                     );
+                    for (block, keys) in [
+                        ("process", &["pidfile", "absent_after"][..]),
+                        ("log", &["path", "stale_after", "error_regex"][..]),
+                        ("artifact", &["path", "stale_after", "min_bytes"][..]),
+                    ] {
+                        if let Some(value) = job.get(block) {
+                            warn_children(value, &format!("{path}.{block}"), keys, |_| {});
+                        }
+                    }
                     if let Some(alive) = job.get("alive") {
                         warn_children(
                             alive,
@@ -618,11 +724,38 @@ struct RawTelegram {
 #[derive(Deserialize)]
 struct RawJob {
     name: String,
+    mode: Option<String>,
     alive: Option<RawAlive>,
     worked: Option<RawSilence>,
     freshness: Option<RawSilence>,
     #[serde(default, rename = "ratio")]
     ratios: Vec<RawRatio>,
+    process: Option<RawProcess>,
+    log: Option<RawLog>,
+    artifact: Option<RawArtifact>,
+}
+
+#[derive(Deserialize)]
+struct RawProcess {
+    pidfile: PathBuf,
+    #[serde(default, with = "humantime_serde")]
+    absent_after: Option<Duration>,
+}
+
+#[derive(Deserialize)]
+struct RawLog {
+    path: PathBuf,
+    #[serde(with = "humantime_serde")]
+    stale_after: Duration,
+    error_regex: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct RawArtifact {
+    path: PathBuf,
+    #[serde(with = "humantime_serde")]
+    stale_after: Duration,
+    min_bytes: Option<u64>,
 }
 
 #[derive(Deserialize)]
@@ -943,12 +1076,135 @@ impl RawJob {
             ratios.push(ratio);
         }
 
+        let invalid = |message: String| ConfigError::InvalidThreshold {
+            job: self.name.clone(),
+            message,
+        };
+
+        let mode = match self.mode.as_deref() {
+            None | Some("active") => JobMode::Active,
+            Some("passive") => JobMode::Passive,
+            Some(other) => {
+                return Err(invalid(format!(
+                    "mode {other:?} is not one of \"active\" or \"passive\""
+                )))
+            }
+        };
+
+        // A job that is not sending heartbeats cannot be judged on missing
+        // them. Catching this at startup beats discovering it as a permanent
+        // alert five minutes after deploy.
+        if mode == JobMode::Passive && alive.is_some() {
+            return Err(invalid(
+                "a passive job is watched from outside and sends no heartbeats, so a \
+                 [job.alive] block would fire forever"
+                    .to_string(),
+            ));
+        }
+
+        let process = self
+            .process
+            .map(|raw| raw.resolve(&self.name))
+            .transpose()?;
+        let log = self.log.map(|raw| raw.resolve(&self.name)).transpose()?;
+        let artifact = self
+            .artifact
+            .map(|raw| raw.resolve(&self.name))
+            .transpose()?;
+
+        if mode == JobMode::Passive && process.is_none() && log.is_none() && artifact.is_none() {
+            return Err(invalid(
+                "a passive job needs at least one of [job.process], [job.log] or \
+                 [job.artifact]; otherwise nothing is watching it at all"
+                    .to_string(),
+            ));
+        }
+
         Ok(JobConfig {
             name: self.name,
             alive,
             worked,
             freshness,
             ratios,
+            mode,
+            process,
+            log,
+            artifact,
+        })
+    }
+}
+
+impl RawProcess {
+    fn resolve(self, job: &str) -> Result<ProcessWatch, ConfigError> {
+        if self.pidfile.as_os_str().is_empty() {
+            return Err(ConfigError::InvalidThreshold {
+                job: job.to_string(),
+                message: "process.pidfile must be a path".to_string(),
+            });
+        }
+
+        Ok(ProcessWatch {
+            pidfile: self.pidfile,
+            absent_after: self.absent_after.unwrap_or(DEFAULT_ABSENT_AFTER),
+        })
+    }
+}
+
+impl RawLog {
+    fn resolve(self, job: &str) -> Result<LogWatch, ConfigError> {
+        let invalid = |message: String| ConfigError::InvalidThreshold {
+            job: job.to_string(),
+            message,
+        };
+
+        if self.path.as_os_str().is_empty() {
+            return Err(invalid("log.path must be a path".to_string()));
+        }
+        if self.stale_after.is_zero() {
+            return Err(invalid(
+                "log.stale_after must be greater than zero".to_string(),
+            ));
+        }
+
+        let error_regex = self
+            .error_regex
+            .map(|pattern| {
+                Regex::new(&pattern).map_err(|source| ConfigError::InvalidRegex {
+                    job: job.to_string(),
+                    pattern,
+                    source: Box::new(source),
+                })
+            })
+            .transpose()?;
+
+        Ok(LogWatch {
+            path: self.path,
+            stale_after: self.stale_after,
+            error_regex,
+        })
+    }
+}
+
+impl RawArtifact {
+    fn resolve(self, job: &str) -> Result<ArtifactWatch, ConfigError> {
+        let invalid = |message: String| ConfigError::InvalidThreshold {
+            job: job.to_string(),
+            message,
+        };
+
+        if self.path.as_os_str().is_empty() {
+            return Err(invalid("artifact.path must be a path".to_string()));
+        }
+        if self.stale_after.is_zero() {
+            return Err(invalid(
+                "artifact.stale_after must be greater than zero".to_string(),
+            ));
+        }
+
+        Ok(ArtifactWatch {
+            path: self.path,
+            stale_after: self.stale_after,
+            min_bytes: self.min_bytes.unwrap_or_default(),
         })
     }
 }
@@ -1709,6 +1965,151 @@ name = "product-scraper"
         assert_eq!(config.jobs[0].ratios.len(), 2);
         assert!(config.jobs[0].ratios[0].message.is_some());
         assert!(config.jobs[0].ratios[1].message.is_none());
+    }
+
+    // -- passive mode ------------------------------------------------------
+
+    #[test]
+    fn the_spec_example_passive_job_resolves() {
+        let config = load(
+            r#"
+[[job]]
+name = "clients-etl"
+mode = "passive"
+
+  [job.process]
+  pidfile = "/var/run/etl.pid"
+
+  [job.log]
+  path        = "/var/log/etl.log"
+  stale_after = "10m"
+  error_regex = "(?i)(traceback|fatal|failed to write)"
+
+  [job.artifact]
+  path        = "/data/exports/daily.csv"
+  stale_after = "26h"
+  min_bytes   = 1024
+"#,
+        );
+
+        let job = &config.jobs[0];
+        assert_eq!(job.mode, JobMode::Passive);
+        assert!(job.is_passive());
+
+        let process = job.process.as_ref().expect("process");
+        assert_eq!(process.pidfile, PathBuf::from("/var/run/etl.pid"));
+        assert_eq!(process.absent_after, Duration::from_secs(60), "default");
+
+        let log = job.log.as_ref().expect("log");
+        assert_eq!(log.stale_after, Duration::from_secs(600));
+        let regex = log.error_regex.as_ref().expect("regex");
+        assert!(regex.is_match("Traceback (most recent call last):"));
+        assert!(regex.is_match("FATAL: out of memory"));
+        assert!(!regex.is_match("wrote 400 rows"));
+
+        let artifact = job.artifact.as_ref().expect("artifact");
+        assert_eq!(artifact.stale_after, Duration::from_secs(26 * 3_600));
+        assert_eq!(artifact.min_bytes, 1_024);
+    }
+
+    /// A job that sends no heartbeats cannot be judged on missing them. Catching
+    /// it at startup beats a permanent alert five minutes after deploy.
+    #[test]
+    fn a_passive_job_may_not_declare_a_liveness_rule() {
+        let err = Config::from_toml(
+            r#"
+[[job]]
+name = "clients-etl"
+mode = "passive"
+  [job.alive]
+  expect_every = "60s"
+  [job.process]
+  pidfile = "/var/run/etl.pid"
+"#,
+            &no_env(),
+        )
+        .expect_err("should fail");
+
+        assert!(err.to_string().contains("fire forever"), "{err}");
+    }
+
+    #[test]
+    fn a_passive_job_with_nothing_to_watch_is_rejected() {
+        let err = Config::from_toml(
+            r#"
+[[job]]
+name = "clients-etl"
+mode = "passive"
+"#,
+            &no_env(),
+        )
+        .expect_err("should fail");
+
+        assert!(err.to_string().contains("nothing is watching it"), "{err}");
+    }
+
+    /// Watching a job's output does not stop it also reporting in. A job that
+    /// beats *and* has its export watched is a perfectly good arrangement.
+    #[test]
+    fn an_active_job_may_still_have_its_artifact_watched() {
+        let config = load(
+            r#"
+[[job]]
+name = "nightly-sync"
+  [job.alive]
+  expect_every = "60s"
+  [job.artifact]
+  path        = "/data/exports/daily.csv"
+  stale_after = "26h"
+"#,
+        );
+
+        let job = &config.jobs[0];
+        assert_eq!(job.mode, JobMode::Active);
+        assert!(job.alive.is_some());
+        assert!(job.artifact.is_some());
+        assert_eq!(job.artifact.as_ref().expect("artifact").min_bytes, 0);
+    }
+
+    #[test]
+    fn an_uncompilable_error_regex_is_a_startup_error_naming_it() {
+        let err = Config::from_toml(
+            r#"
+[[job]]
+name = "clients-etl"
+  [job.log]
+  path        = "/var/log/etl.log"
+  stale_after = "10m"
+  error_regex = "(unclosed"
+"#,
+            &no_env(),
+        )
+        .expect_err("should fail");
+
+        assert!(
+            matches!(&err, ConfigError::InvalidRegex { pattern, .. } if pattern == "(unclosed"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn an_unknown_mode_is_rejected() {
+        let err = Config::from_toml("[[job]]\nname = \"x\"\nmode = \"observant\"\n", &no_env())
+            .expect_err("should fail");
+
+        assert!(err.to_string().contains("observant"), "{err}");
+    }
+
+    #[test]
+    fn a_zero_stale_after_is_rejected() {
+        for block in ["log", "artifact"] {
+            let text = format!(
+                "[[job]]\nname = \"x\"\n  [job.{block}]\n  path = \"/tmp/x\"\n  \
+                 stale_after = \"0s\"\n"
+            );
+            let err = Config::from_toml(&text, &no_env()).expect_err("should fail");
+            assert!(err.to_string().contains("stale_after"), "{block}: {err}");
+        }
     }
 
     // -- checks ------------------------------------------------------------
