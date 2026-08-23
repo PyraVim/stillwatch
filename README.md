@@ -20,15 +20,30 @@ curl -fsS -X POST localhost:9111/beat/nightly-sync
 If the beats stop for longer than you said they should, you get a message that
 tells you what happened, what *isn't* wrong, and what it probably means.
 
+The beat can carry more, and each part is judged separately:
+
+```bash
+curl -fsS -X POST localhost:9111/beat/nightly-sync \
+  -H 'content-type: application/json' \
+  -d '{"worked":true,"data_ts":1724500000,"counters":{"rows_read":8400,"rows_written":8400}}'
+```
+
+* **`worked`** — whether the loop actually *did* something, as opposed to
+  merely running. Catches the job that's up, looping, and producing nothing.
+* **`data_ts`** — how fresh the data it acted on was. Catches the job reporting
+  in punctually about a source that froze nine minutes ago.
+* **`counters`** — any two of them can be made into a rule. Catches the scraper
+  fetching fine and parsing nothing.
+
 **Dependency probes.** stillwatch polls the things your jobs depend on and
 watches their latency against their *own* recent normal — because a dependency
 that has always taken 400ms is fine, and one that took 90ms an hour ago is not.
 It catches the API that still returns 200 on every request and now takes 1.4s.
 
-Either way you get one message per incident, not one per evaluation cycle, and
+Throughout, you get one message per incident, not one per evaluation cycle, and
 an all-clear with the duration when it ends.
 
-That's version 0.2. The rest of the plan is in [Roadmap](#roadmap), and none of
+That's version 0.3. The rest of the plan is in [Roadmap](#roadmap), and none of
 it is built yet.
 
 ---
@@ -55,9 +70,7 @@ The failures worth catching are the ones where the job is up and wrong:
 | **Working but not landing** | Every attempt fails. Process healthy, dependencies healthy, output zero. |
 | **Degraded, not down** | An API that answered in 90ms now takes 1.4s. Still 200 OK. Every check passes. Everything gets slower and nobody is told. |
 
-Version 0.1 catches the first — the loop stopping entirely — and the last, where
-a dependency gets slower and slower while every health check keeps passing. The
-middle two are what the roadmap is for.
+All four are built. That is what version 0.3 is.
 
 ---
 
@@ -76,10 +89,18 @@ So heartbeats carry two separate signals:
 * **`worked`** — I actually did something. Expected irregularly. A long silence
   means *look into it*, not *wake someone up*.
 
-Today `stillwatch` evaluates `alive`. What matters is that it already refuses to
-confuse the two: a job that declares no `[job.alive]` block is **never** judged
-late, however long it stays quiet. A nightly sync does not inherit a scraper's
-cadence, and there is a test with that name on it.
+Both are evaluated, and `stillwatch` refuses to confuse them in two ways.
+
+A job that declares no `[job.alive]` block is **never** judged late, however
+long it stays quiet — a nightly sync does not inherit a scraper's cadence.
+
+And while a job's liveness rule *is* being satisfied, a quiet `worked` signal is
+capped at a warning however long it runs. A job that is provably alive and
+simply has nothing to do is not a page. The cap applies only when something is
+actually vouching for the loop: a job with no liveness rule has nothing standing
+behind it, so its `critical_after` means what it says.
+
+There are tests with both those sentences on them.
 
 ---
 
@@ -110,17 +131,17 @@ requests.post("http://localhost:9111/beat/scraper",
               json={"worked": True, "counters": {"fetched": 120, "parsed": 118}})
 ```
 
-`worked`, `data_ts` and `counters` are accepted and logged today. Nothing
-evaluates them yet — they're part of the wire protocol so that jobs can start
-sending them now and not need changing later.
+Only an explicit `worked: true` marks work. A bare beat says the loop ran, not
+that it accomplished anything, and that distinction is the whole point.
 
 Two responses that aren't `200`:
 
 * **`404`** — no job by that name is configured. A typo in the URL must not
   leave the real job silently unwatched, so it's refused and logged rather than
   quietly accepted.
-* **`400`** — there was a body and it wasn't valid JSON. It does not count as a
-  heartbeat.
+* **`400`** — the body wasn't valid JSON, or a counter was negative or not a
+  finite number. A `NaN` compares false against everything, so one of them would
+  silently stop a ratio rule firing for good. It does not count as a heartbeat.
 
 ---
 
@@ -142,10 +163,32 @@ name = "product-scraper"
   warn_after     = "5m"      # optional, defaults to 5x expect_every
   critical_after = "15m"     # optional, defaults to 15x expect_every
 
+  [job.worked]
+  warn_after     = "2h"      # up and looping, but accomplishing nothing
+  critical_after = "6h"      # capped at a warning while [job.alive] is satisfied
+
+  [job.freshness]
+  warn_after     = "10m"     # measured from data_ts, not from when the beat arrived
+  critical_after = "30m"
+
+  [[job.ratio]]
+  name        = "parse rate"
+  numerator   = "parsed"
+  denominator = "fetched"
+  window      = "1h"
+  min         = 0.9
+  min_sample  = 50           # below this the rule reports as unjudged, not passing
+  message     = "fetching fine, parsing broken — source markup likely changed"
+
 # --- a nightly job that should be quiet most of the day ---
-# No [job.alive] block, so it is never judged late.
+# No [job.alive] block, so it is never judged late — and nothing vouches for its
+# loop, so its worked thresholds are not capped.
 [[job]]
 name = "nightly-sync"
+
+  [job.worked]
+  warn_after     = "26h"     # missed one run
+  critical_after = "50h"     # missed two
 
 # --- a dependency, probed directly ---
 [[check]]
@@ -195,6 +238,64 @@ Config for features that aren't built yet parses without error and logs a warnin
 naming every key it ignored. A line that does nothing should never do so quietly.
 
 See [`stillwatch.toml.example`](stillwatch.toml.example) for the annotated version.
+
+---
+
+## Not judged yet is not the same as fine
+
+The most comfortable way for a monitoring tool to be wrong is to stay quiet for
+a reason that has nothing to do with health. Every rule here can be in a third
+state — *not judging anything* — and it is never reported as passing.
+
+* A ratio below its `min_sample` has no verdict. Twenty fetches and zero parses
+  is not evidence of a broken parser; it's not evidence of anything.
+* A job that has never sent `data_ts` is not fresh. There is no data age to
+  measure.
+* A dependency check without enough probes has no baseline to compare against.
+
+`min_sample` must be at least 1, which is also what makes a ratio safe to
+compute: the rule is skipped as unjudged long before the denominator could be
+zero. A scraper that fetched nothing has no parse rate, and stillwatch says that
+rather than reporting 0%.
+
+None of these page — they aren't incidents. They're logged when they change, so
+you can see at a glance which of your rules are actually doing something.
+
+Two cases *are* worth a message, because they never resolve on their own and are
+indistinguishable from health from the outside:
+
+* a `[job.freshness]` block where beats keep arriving and none has ever carried
+  `data_ts`
+* a ratio naming a counter no beat has ever sent — almost always a typo, and the
+  rule can never fire
+
+```
+⚠️  clients-etl — write rate is configured against a counter that never arrives
+    412 beats in 6h, not one carrying "rows_reed"
+    nothing has failed this rule · it has never been able to run
+    → check the counter name against what the job actually sends; as it stands
+      this rule can never fire
+```
+
+**Counters are per beat, not running totals.** Each beat reports what happened
+that time round the loop, and stillwatch sums across the window. A job sending
+cumulative lifetime totals will produce meaningless sums.
+
+---
+
+## One dead job is one message
+
+A job whose loop has stopped will also stop doing work, stop refreshing its data
+and stop moving its counters. Reporting all four would be four messages about
+one fact, with the one that explains the rest buried among them.
+
+So while liveness is failing, that job's other rules are suppressed. And an
+incident suppressed this way is *held open*, not resolved — a collapsed parse
+rate on a job that has since died did not get better, and saying so would be
+precisely the confidently-wrong message this tool exists to avoid.
+
+A job that is alive and healthy is different: there, each finding is genuinely
+independent and each gets its own message and its own all-clear.
 
 ---
 
@@ -256,6 +357,21 @@ some extreme.
     the multiples cannot fire
     still responding · this is latency, not an outage
     → past the 2s you said was unacceptable; everything downstream is waiting that long
+
+⚠️  product-scraper — no work in 3h
+    last work 11:02:14 -04:00, expected at least every 2h
+    still beating · the loop is running, it just has not reported any work
+    → this is the idle-dead case: up, looping, and producing nothing
+
+⚠️  product-scraper — parse rate 40.8% (min 90%)
+    last 1h: 1,200 fetched, 490 parsed
+    beats arriving ✓ · the loop is running, the work is not landing
+    → fetching fine, parsing broken — source markup likely changed
+
+⚠️  price-feed — acting on data 22m old
+    data timestamped 14:31:02 -04:00, expected fresher than 10m
+    the job itself is reporting in · this is the source, not the job
+    → whatever it produced since then was computed from numbers this old
 
 🔴  queue-broker — down for 2m4s
     4 probes in a row failed; the last said: connection refused
@@ -330,7 +446,6 @@ whether today's version is worth adopting anyway.
 
 | | |
 |-|-|
-| **Freshness, `worked`, counter ratios** | Evaluate the other half of the heartbeat: how stale the data is, whether real work is happening, and generic named-counter rules (`parsed / fetched`, `rows_written / rows_read`, `landed / submitted` — same machinery, no domain knowledge). |
 | **Job → dependency links** | Today a job alert can't say "the scraper is down, not its dependency", because nothing in the config associates a job with the checks it relies on. Needs something like `depends_on = ["vendor-api"]`. |
 | **`learn` mode** | `stillwatch learn --job x --for 6h` observes without alerting, then emits a config block with the evidence behind every number. Nobody knows their job's real cadence, and a watchdog with wrong thresholds either pages constantly until muted or never fires. |
 | **`--dry-run`** | Evaluate live and log what it *would* have sent. People need to watch it be right for a day before trusting it with their phone. |

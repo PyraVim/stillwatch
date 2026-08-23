@@ -76,6 +76,57 @@ name = "product-scraper"
   warn_after     = "5m"
   critical_after = "15m"
 
+  # How long the job may go without doing real work. Only an explicit
+  # `worked: true` in the beat body counts — a bare beat says the loop ran, not
+  # that it accomplished anything, and that distinction is the whole point.
+  #
+  # critical_after is optional here: a job may want telling without waking
+  # anyone. And while this job's [job.alive] rule is being satisfied, a quiet
+  # `worked` signal is capped at a warning however long it runs. A job that is
+  # provably alive and simply has nothing to do is not a page.
+  [job.worked]
+  warn_after     = "2h"
+  critical_after = "6h"
+
+  # How stale the data the job acts on may get, measured from the `data_ts` in
+  # the beat body — not from when the beat arrived. A job reporting punctually
+  # about frozen data is exactly the failure this catches.
+  #
+  # If no beat ever carries data_ts, this rule is reported as not judging
+  # anything rather than quietly passing, and stillwatch says so once.
+  [job.freshness]
+  warn_after     = "10m"
+  critical_after = "30m"
+
+  # Generic named counters. The job decides what they mean; this decides what
+  # is alarming. A scraper reports fetched/parsed, an ETL reports
+  # read/written, a bot reports submitted/landed. Same machinery, and
+  # stillwatch never learns what any of them mean.
+  #
+  # Counters are PER BEAT, not running totals. Each beat reports what happened
+  # that time round the loop, and stillwatch sums them across the window. A job
+  # sending cumulative lifetime totals will produce meaningless sums here.
+  #
+  # Only beats carrying the denominator contribute. Within such a beat, a
+  # missing numerator counts as zero: a scrape that fetched 20 pages and
+  # reports no `parsed` count parsed none.
+  [[job.ratio]]
+  name        = "parse rate"
+  numerator   = "parsed"
+  denominator = "fetched"
+  window      = "1h"
+  min         = 0.9         # the floor, as a fraction
+
+  # Denominator total needed before the rule is judged at all. Below this the
+  # rule reports as not-yet-judged rather than passing — a quiet hour is not
+  # evidence of health. It must be at least 1, which is also what makes the
+  # ratio safe to compute: a zero denominator can never reach it.
+  min_sample  = 50
+
+  # Optional. Your words, used as the alert's closing line, because you know
+  # what these counters mean and stillwatch deliberately does not.
+  message     = "fetching fine, parsing broken — source markup likely changed"
+
 
 # ---------------------------------------------------------------------------
 # A job that is quiet by design
@@ -86,9 +137,25 @@ name = "product-scraper"
 # never declared a cadence does not inherit one. Its beats are still recorded,
 # and a beat for a name that is not configured here is refused with a 404 and
 # logged — a typo in the URL must not leave the real job silently unwatched.
+#
+# What it *does* declare is when the absence of work becomes suspicious. With
+# no liveness rule vouching for the loop, nothing caps the severity here, so
+# missing two nights running is a page.
 
 [[job]]
 name = "nightly-sync"
+
+  [job.worked]
+  warn_after     = "26h"      # missed one run
+  critical_after = "50h"      # missed two
+
+  [[job.ratio]]
+  name        = "write rate"
+  numerator   = "rows_written"
+  denominator = "rows_read"
+  window      = "24h"
+  min         = 0.99
+  min_sample  = 100
 
 
 # ---------------------------------------------------------------------------
@@ -154,7 +221,7 @@ down_after = "60s"
 # Not yet implemented
 # ---------------------------------------------------------------------------
 #
-# This version evaluates the `alive` signal and dependency checks. Config for
-# anything else — [job.worked], [job.freshness], [[job.ratio]] — parses without
-# error but is not acted on, and stillwatch logs a warning at startup naming
-# each key it is ignoring, so a line that does nothing never does so quietly.
+# Every block above is evaluated. Config for anything else — passive mode's
+# [job.process], [job.log], [job.artifact] — parses without error but is not
+# acted on, and stillwatch logs a warning at startup naming each key it is
+# ignoring, so a line that does nothing never does so quietly.
