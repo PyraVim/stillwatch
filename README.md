@@ -43,7 +43,7 @@ It catches the API that still returns 200 on every request and now takes 1.4s.
 Throughout, you get one message per incident, not one per evaluation cycle, and
 an all-clear with the duration when it ends.
 
-That's version 0.3. The rest of the plan is in [Roadmap](#roadmap), and none of
+That's version 0.4. The rest of the plan is in [Roadmap](#roadmap), and none of
 it is built yet.
 
 ---
@@ -70,7 +70,7 @@ The failures worth catching are the ones where the job is up and wrong:
 | **Working but not landing** | Every attempt fails. Process healthy, dependencies healthy, output zero. |
 | **Degraded, not down** | An API that answered in 90ms now takes 1.4s. Still 200 OK. Every check passes. Everything gets slower and nobody is told. |
 
-All four are built. That is what version 0.3 is.
+All four are built.
 
 ---
 
@@ -299,6 +299,86 @@ independent and each gets its own message and its own all-clear.
 
 ---
 
+## Don't guess your thresholds
+
+A watchdog with wrong thresholds is worse than none. It either pages you
+constantly until you mute it, or never fires at all. Nobody knows their job's
+real cadence off the top of their head.
+
+```bash
+stillwatch learn --for 6h > learned.toml
+```
+
+Observe-only — no evaluator and no notifier are started at all, so it's safe to
+point at production before you trust anything. It records what actually happens
+and prints a config block with the evidence behind every number:
+
+```toml
+[[job]]
+name = "product-scraper"
+
+  [job.alive]
+  expect_every   = "60s"    # observed p50 60s, p99 63s, worst 71s over 358 beats
+  warn_after     = "5m"     # 4x the worst gap seen
+  critical_after = "15m"    # 3x warn_after
+```
+
+Never tighter than the worst thing observed, always with the evidence attached
+so you can argue with it. What it prints loads — there's a test that runs the
+output back through the config parser at every cadence from one second to a day.
+
+### It refuses rather than guessing
+
+**An incident inside the observation window is the danger here**, and it's worse
+than the runtime version of the same problem. A rolling baseline heals as its
+window rolls; a learned threshold gets pasted into a file and trusted for
+months. Forty minutes of outage during learning becomes a forty-minute "worst
+gap", which becomes a threshold the real failure can never cross.
+
+So gaps far out of line with the rest of the window — over 5× the median, which
+ordinary jitter never reaches — are treated as incidents, excluded from the
+derivation, and **named in the output**:
+
+```toml
+  [job.alive]
+  # NOTE: 1 beat gap(s) up to 40m looked like incidents rather than cadence
+  # (over 5x the median) and were EXCLUDED from the numbers below.
+  # If those were normal for this job, widen the thresholds by hand.
+```
+
+And where excluding isn't enough, it declines:
+
+* **more than a quarter of the window inside suspected incidents** — there's no
+  normal left in it to learn
+* **fewer than 20 intervals** — six samples make a confident-looking number and
+  a meaningless one
+* **a signal that never arrived** — no `worked: true`, no `data_ts`, no probes
+
+Refusals are still valid TOML, so redirecting to a file leaves an explanation
+rather than a mystery.
+
+One limit worth stating plainly: if the dependency was slow, or the job broken,
+for the *entire* window, nothing here can tell. There's no normal to compare
+against, and the median is the broken value. That's why every number comes with
+its evidence — the numbers themselves are the check.
+
+---
+
+## Watch it be right before you trust it
+
+```bash
+stillwatch --dry-run
+```
+
+Evaluates everything live and logs what it *would* have sent, delivering
+nothing. Because deduplication, escalation and recovery all live above the
+notifier, a dry run logs **once per incident** — exactly what the real thing
+would deliver, not what the evaluator produced every five seconds. A dry run
+that read noisier than the daemon would be worthless: nobody would switch the
+real one on.
+
+---
+
 ## A baseline is only worth what it learned
 
 Comparing a dependency against its own history is the right idea and it has two
@@ -447,10 +527,11 @@ whether today's version is worth adopting anyway.
 | | |
 |-|-|
 | **Job → dependency links** | Today a job alert can't say "the scraper is down, not its dependency", because nothing in the config associates a job with the checks it relies on. Needs something like `depends_on = ["vendor-api"]`. |
+| **Cumulative counters** | Counters are per beat. A job sending running lifetime totals produces meaningless sums and nothing detects it. Detecting monotonic series and diffing them needs reset handling to be worth having. |
 | **`learn` mode** | `stillwatch learn --job x --for 6h` observes without alerting, then emits a config block with the evidence behind every number. Nobody knows their job's real cadence, and a watchdog with wrong thresholds either pages constantly until muted or never fires. |
 | **`--dry-run`** | Evaluate live and log what it *would* have sent. People need to watch it be right for a day before trusting it with their phone. |
 | **Passive mode** | Watch something you can't modify: a pidfile, a log that should still be moving, an output file that should still be appearing. Weaker signals than a heartbeat, and the docs will say so — but "I can watch this today without touching your code" is what makes it usable on day one. |
-| **Flap damping** | Require a condition to hold through a confirmation window. Something that fixes itself in four seconds is not an incident. |
+| **Flap damping** | Require a condition to hold through a confirmation window. Something that fixes itself in four seconds is not an incident. `down_after` already does this for checks; the job signals do not have an equivalent. |
 | **Incident log and `report`** | Append every incident to JSONL; `stillwatch report --since 7d` prints per-subject uptime, incident count and longest outage — including gaps when `stillwatch` itself wasn't watching, rather than claiming 100% for a window it missed. |
 | **Deploy** | Dockerfile and a systemd unit. |
 

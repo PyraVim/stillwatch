@@ -13,6 +13,20 @@
 #
 # The config path also comes from $STILLWATCH_CONFIG, and falls back to
 # ./stillwatch.toml.
+#
+# Don't guess the numbers below — measure them:
+#     stillwatch learn --for 6h > learned.toml
+#
+# That watches without evaluating or alerting on anything, then prints these
+# blocks with the evidence behind each number. It excludes anything in the
+# window that looked like an incident (and says so), and refuses to derive at
+# all from a window too short, too quiet, or mostly outage.
+#
+# And before trusting it with your phone:
+#     stillwatch --dry-run
+#
+# which evaluates everything live and logs what it would have sent — once per
+# incident, exactly as the real notifier would — while sending nothing.
 
 
 # Where the heartbeat receiver listens. Defaults to 127.0.0.1:9111.

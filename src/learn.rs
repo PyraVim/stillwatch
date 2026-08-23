@@ -287,7 +287,10 @@ pub fn silence_thresholds(worst: Duration) -> SilenceThresholds {
 /// than the worst thing actually observed.
 pub fn round_up(d: Duration) -> Duration {
     let step = step_for(d).max(1);
-    let secs = d.as_secs().max(1);
+    // Ceiling the sub-second part first. Truncating it would quietly eat the
+    // margin at fast cadences — a 1.25s threshold became 1s, exactly the worst
+    // gap observed, so it would fire on the next ordinary slow beat.
+    let secs = (d.as_secs_f64().ceil() as u64).max(1);
     Duration::from_secs(secs.div_ceil(step) * step)
 }
 
@@ -788,6 +791,28 @@ mod tests {
         );
         assert!(derived.critical_after >= worst * 2, "roughly two runs late");
         assert!(derived.critical_after > derived.warn_after);
+    }
+
+    /// Regression, found by running it at a one-second cadence: rounding
+    /// truncated the sub-second part, so a 1.25s threshold came out as 1s —
+    /// exactly the worst gap observed, and therefore certain to fire on the
+    /// next ordinary slow beat.
+    #[test]
+    fn a_margin_survives_rounding_even_at_a_one_second_cadence() {
+        for worst_secs in [1, 2, 3, 5] {
+            let worst = Duration::from_secs(worst_secs);
+            let derived = silence_thresholds(worst);
+
+            assert!(
+                derived.warn_after > worst,
+                "worst {worst_secs}s: warn {:?} left no margin",
+                derived.warn_after
+            );
+            assert!(
+                derived.critical_after > derived.warn_after,
+                "worst {worst_secs}s"
+            );
+        }
     }
 
     // -- rounding ----------------------------------------------------------
