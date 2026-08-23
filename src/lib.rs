@@ -8,6 +8,7 @@ pub mod evaluate;
 pub mod fmt;
 pub mod learn;
 pub mod notify;
+pub mod passive;
 pub mod prober;
 pub mod receiver;
 pub mod state;

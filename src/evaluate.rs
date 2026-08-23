@@ -5,10 +5,13 @@
 //! the same `now`, it returns the same answer. Tests drive time directly and
 //! never sleep.
 
+use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
 use crate::config::{DegradationConfig, RatioConfig};
-use crate::state::{percentile, CheckState, JobState, Observation, Outcome, State};
+use crate::state::{
+    percentile, CheckState, FileFinding, JobState, Observation, Outcome, ProcessFinding, State,
+};
 
 /// The percentile latency is judged at, for both the baseline and the current
 /// window. A p90 ignores the one-in-ten slow request that every dependency has
@@ -104,6 +107,49 @@ pub enum Reason {
         waiting_for: Duration,
     },
 
+    /// A watched process is not there.
+    ProcessAbsent {
+        /// How long it has been gone, measured from `since`.
+        absent_for: Duration,
+        since: LastSeen,
+        pidfile: PathBuf,
+        detail: ProcessAbsence,
+    },
+
+    /// A watched file has stopped changing.
+    FileStale {
+        what: WatchedFile,
+        path: PathBuf,
+        stale_for: Duration,
+        since: LastSeen,
+        stale_after: Duration,
+        /// How many times the file was rotated while being watched.
+        rotations: u64,
+    },
+
+    /// A watched file cannot be read.
+    FileMissing {
+        what: WatchedFile,
+        path: PathBuf,
+        missing_for: Duration,
+        detail: FileAbsence,
+    },
+
+    /// The artifact is being produced, but it is too small to be real output.
+    ArtifactTooSmall {
+        path: PathBuf,
+        size: u64,
+        min_bytes: u64,
+        modified: Option<SystemTime>,
+    },
+
+    /// The job logged something matching the pattern it was told to watch for.
+    LoggedError {
+        path: PathBuf,
+        at: SystemTime,
+        line: String,
+    },
+
     /// Every probe for at least `down_after` has failed.
     CheckDown {
         failing_for: Duration,
@@ -131,6 +177,52 @@ pub enum Reason {
         baseline_window: Duration,
         absolute_ceiling: Duration,
     },
+}
+
+/// Which passive file signal a finding is about.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum WatchedFile {
+    Log,
+    Artifact,
+}
+
+impl WatchedFile {
+    pub fn noun(self) -> &'static str {
+        match self {
+            WatchedFile::Log => "log",
+            WatchedFile::Artifact => "output",
+        }
+    }
+}
+
+/// Why a watched file could not be looked at.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FileAbsence {
+    NotThere {
+        /// `false` when it has never been seen since the watch began — a
+        /// different fact, and usually a different cause.
+        existed_before: bool,
+    },
+
+    /// It is there, but something stopped us reading it. Usually permissions,
+    /// which is a real finding and not the same as the job being broken.
+    Unreadable(String),
+}
+
+/// Why a watched process could not be confirmed running.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProcessAbsence {
+    /// The pidfile is there and names a process that is not.
+    ProcessGone { pid: u32 },
+
+    /// No pidfile at all.
+    PidfileMissing {
+        /// `false` when there has never been one since the watch began.
+        existed_before: bool,
+    },
+
+    /// The pidfile is there but says nothing usable.
+    PidfileUnreadable(String),
 }
 
 /// What the current latency is being compared against.
@@ -206,6 +298,11 @@ pub enum Condition {
     NoWork,
     Stale,
     FreshnessUnreported,
+    ProcessAbsent,
+    FileStale(WatchedFile),
+    FileMissing(WatchedFile),
+    ArtifactTooSmall,
+    LoggedError,
     /// Keyed by rule name: a job may carry several ratio rules, and each is its
     /// own incident.
     Ratio(String),
@@ -227,6 +324,11 @@ impl Reason {
             Reason::FreshnessNeverReported { .. } => "a freshness rule with no data".to_string(),
             Reason::RatioBelowMin { rule, .. } => format!("a low {rule}"),
             Reason::RatioCounterNeverReported { rule, .. } => format!("{rule} with no data"),
+            Reason::ProcessAbsent { .. } => "no process".to_string(),
+            Reason::FileStale { what, .. } => format!("a stale {}", what.noun()),
+            Reason::FileMissing { what, .. } => format!("a missing {}", what.noun()),
+            Reason::ArtifactTooSmall { .. } => "empty output".to_string(),
+            Reason::LoggedError { .. } => "an error in the log".to_string(),
             Reason::CheckDown { .. } => "down".to_string(),
             Reason::Degraded { .. } => "degraded".to_string(),
             Reason::BaselineNotCredible { .. } => "an untrustworthy baseline".to_string(),
@@ -243,6 +345,11 @@ impl Reason {
             Reason::RatioCounterNeverReported { rule, .. } => {
                 Condition::RatioUnreported(rule.clone())
             }
+            Reason::ProcessAbsent { .. } => Condition::ProcessAbsent,
+            Reason::FileStale { what, .. } => Condition::FileStale(*what),
+            Reason::FileMissing { what, .. } => Condition::FileMissing(*what),
+            Reason::ArtifactTooSmall { .. } => Condition::ArtifactTooSmall,
+            Reason::LoggedError { .. } => Condition::LoggedError,
             Reason::CheckDown { .. } => Condition::Down,
             Reason::Degraded { .. } => Condition::Degraded,
             Reason::BaselineNotCredible { .. } => Condition::UntrustworthyBaseline,
@@ -376,7 +483,207 @@ fn assess_job(job: &JobState, watch_started: SystemTime, now: SystemTime) -> Vec
     for rule in &job.config.ratios {
         findings.extend(assess_ratio(job, rule, watch_started, now));
     }
+    findings.extend(assess_process(job, watch_started, now));
+    findings.extend(assess_log(job, watch_started, now));
+    findings.extend(assess_artifact(job, watch_started, now));
     findings
+}
+
+/// Is the process there at all?
+fn assess_process(
+    job: &JobState,
+    watch_started: SystemTime,
+    now: SystemTime,
+) -> Option<Assessment> {
+    let watch = job.config.process.as_ref()?;
+
+    // Nothing has looked yet. Not knowing is not the same as finding nothing.
+    let finding = job.passive.process.as_ref()?;
+
+    let detail = match finding {
+        ProcessFinding::Running { .. } => return None,
+        ProcessFinding::NotRunning { pid } => ProcessAbsence::ProcessGone { pid: *pid },
+        ProcessFinding::PidfileMissing => ProcessAbsence::PidfileMissing {
+            // "There is no pidfile and there never was" is a different fact
+            // from "the pidfile went away", and points somewhere else: a wrong
+            // path, or a job that has not been started yet.
+            existed_before: job.passive.pidfile_ever_seen,
+        },
+        ProcessFinding::PidfileUnreadable(why) => ProcessAbsence::PidfileUnreadable(why.clone()),
+    };
+
+    // The same dead-on-arrival shape as a heartbeat: with no confirmed sighting
+    // the absence is measured from when the watch began, and the alert says so
+    // rather than implying it saw the process running and then lose it.
+    let (since, measured_from) = match job.passive.process_last_running {
+        Some(last) => (LastSeen::Observed(last), last),
+        None => (LastSeen::WatchdogStart(watch_started), watch_started),
+    };
+
+    let absent_for = now.duration_since(measured_from).unwrap_or(Duration::ZERO);
+    if absent_for < watch.absent_after {
+        return None;
+    }
+
+    Some(Assessment {
+        subject: job.name().to_string(),
+        // A process being gone is as bad as it gets for a passive job, but the
+        // signal itself is weak — see the note carried in the alert text.
+        severity: Severity::Critical,
+        reason: Reason::ProcessAbsent {
+            absent_for,
+            since,
+            pidfile: watch.pidfile.clone(),
+            detail,
+        },
+    })
+}
+
+/// Is the log still moving, and did it say anything bad?
+fn assess_log(job: &JobState, watch_started: SystemTime, now: SystemTime) -> Option<Assessment> {
+    let watch = job.config.log.as_ref()?;
+    let finding = job.passive.log.as_ref()?;
+
+    // An error the job logged about itself outranks the file being stale: a
+    // traceback is a cause, staleness is a symptom.
+    if let Some(logged) = &job.passive.log_last_error {
+        if now.duration_since(logged.at).unwrap_or(Duration::ZERO) < watch.stale_after {
+            return Some(Assessment {
+                subject: job.name().to_string(),
+                severity: Severity::Warn,
+                reason: Reason::LoggedError {
+                    path: watch.path.clone(),
+                    at: logged.at,
+                    line: logged.line.clone(),
+                },
+            });
+        }
+    }
+
+    file_assessment(
+        job,
+        WatchedFile::Log,
+        &watch.path,
+        finding,
+        job.passive.log_ever_seen,
+        watch.stale_after,
+        watch_started,
+        now,
+        job.passive.log_rotations,
+    )
+}
+
+/// Is the output actually being produced?
+fn assess_artifact(
+    job: &JobState,
+    watch_started: SystemTime,
+    now: SystemTime,
+) -> Option<Assessment> {
+    let watch = job.config.artifact.as_ref()?;
+    let finding = job.passive.artifact.as_ref()?;
+
+    // A file that exists but is too small to be real output is the classic
+    // "ran, exited zero, wrote nothing". Its age is beside the point.
+    if let FileFinding::Present { size, modified } = finding {
+        if *size < watch.min_bytes {
+            return Some(Assessment {
+                subject: job.name().to_string(),
+                severity: Severity::Warn,
+                reason: Reason::ArtifactTooSmall {
+                    path: watch.path.clone(),
+                    size: *size,
+                    min_bytes: watch.min_bytes,
+                    modified: *modified,
+                },
+            });
+        }
+    }
+
+    file_assessment(
+        job,
+        WatchedFile::Artifact,
+        &watch.path,
+        finding,
+        job.passive.artifact_ever_seen,
+        watch.stale_after,
+        watch_started,
+        now,
+        0,
+    )
+}
+
+/// The part of a file verdict that is the same for a log and an artifact.
+#[allow(clippy::too_many_arguments)]
+fn file_assessment(
+    job: &JobState,
+    what: WatchedFile,
+    path: &Path,
+    finding: &FileFinding,
+    ever_seen: bool,
+    stale_after: Duration,
+    watch_started: SystemTime,
+    now: SystemTime,
+    rotations: u64,
+) -> Option<Assessment> {
+    let subject = job.name().to_string();
+
+    match finding {
+        FileFinding::Missing => {
+            let missing_for = now.duration_since(watch_started).unwrap_or(Duration::ZERO);
+            // A file that has never existed is a wrong path in the config; one
+            // that existed and vanished is something deleting it. Same absence,
+            // different place to go looking, so never the same message.
+            if !ever_seen && missing_for < stale_after {
+                return None;
+            }
+            Some(Assessment {
+                subject,
+                severity: Severity::Warn,
+                reason: Reason::FileMissing {
+                    what,
+                    path: path.to_path_buf(),
+                    missing_for,
+                    detail: FileAbsence::NotThere {
+                        existed_before: ever_seen,
+                    },
+                },
+            })
+        }
+
+        FileFinding::Unreadable(why) => Some(Assessment {
+            subject,
+            severity: Severity::Warn,
+            reason: Reason::FileMissing {
+                what,
+                path: path.to_path_buf(),
+                missing_for: now.duration_since(watch_started).unwrap_or(Duration::ZERO),
+                detail: FileAbsence::Unreadable(why.clone()),
+            },
+        }),
+
+        FileFinding::Present { modified, .. } => {
+            // With no modification time there is nothing to judge staleness
+            // against. Reporting it as fresh would be the comfortable lie.
+            let modified = (*modified)?;
+            let stale_for = now.duration_since(modified).unwrap_or(Duration::ZERO);
+            if stale_for < stale_after {
+                return None;
+            }
+
+            Some(Assessment {
+                subject,
+                severity: Severity::Warn,
+                reason: Reason::FileStale {
+                    what,
+                    path: path.to_path_buf(),
+                    stale_for,
+                    since: LastSeen::Observed(modified),
+                    stale_after,
+                    rotations,
+                },
+            })
+        }
+    }
 }
 
 /// What a ratio rule adds up to over its window.

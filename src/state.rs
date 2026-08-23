@@ -90,6 +90,99 @@ pub struct JobState {
     /// *never* arrived can be told apart from one whose counter simply has not
     /// arrived lately. The first is a typo; the second is a quiet hour.
     seen_counters: BTreeSet<String>,
+
+    /// What watching from outside has found. Untouched for jobs that report in.
+    pub passive: PassiveState,
+}
+
+/// What one look at a pidfile found.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProcessFinding {
+    /// The pidfile named a process that exists.
+    Running { pid: u32 },
+
+    /// The pidfile named a process that does not.
+    NotRunning { pid: u32 },
+
+    /// No pidfile at the configured path.
+    PidfileMissing,
+
+    /// The pidfile is there but could not be read or did not contain a number.
+    PidfileUnreadable(String),
+}
+
+/// What one look at a file found.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FileFinding {
+    Present {
+        size: u64,
+        /// `None` when the filesystem could not say. Not a stand-in for "old".
+        modified: Option<SystemTime>,
+    },
+    Missing,
+    Unreadable(String),
+}
+
+impl FileFinding {
+    pub fn modified(&self) -> Option<SystemTime> {
+        match self {
+            FileFinding::Present { modified, .. } => *modified,
+            _ => None,
+        }
+    }
+}
+
+/// A line the job itself logged that matched the configured error pattern.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LoggedError {
+    pub at: SystemTime,
+    pub line: String,
+}
+
+/// Everything the passive watchers have found out about one job.
+///
+/// Each of the three signals reduces to the same shape as a heartbeat: the last
+/// time the thing was demonstrably fine, plus whether it was *ever* fine. Those
+/// are different facts. A log that has never existed is a wrong path in the
+/// config; a log that existed and stopped moving is a stuck job. Reporting
+/// either as the other sends somebody to look in the wrong place.
+#[derive(Debug, Clone, Default)]
+pub struct PassiveState {
+    /// The most recent look, or `None` if none has happened yet. Before the
+    /// first poll nothing is known, which is not the same as nothing being
+    /// there.
+    pub process: Option<ProcessFinding>,
+
+    /// Last time the process was confirmed to exist.
+    pub process_last_running: Option<SystemTime>,
+
+    pub pidfile_ever_seen: bool,
+
+    pub log: Option<FileFinding>,
+    pub log_ever_seen: bool,
+    pub log_last_error: Option<LoggedError>,
+
+    /// How many times the log has been rotated out from under the tail.
+    ///
+    /// Counted so the alert can say so: a burst of rotations explains an
+    /// apparent gap in what was scanned for errors.
+    pub log_rotations: u64,
+
+    pub artifact: Option<FileFinding>,
+    pub artifact_ever_seen: bool,
+}
+
+/// One look at a log file, as the tailer saw it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LogSample {
+    pub finding: FileFinding,
+
+    /// Whether the file was replaced or truncated since the last look.
+    pub rotated: bool,
+
+    /// The most recent line matching the configured error pattern, if any
+    /// arrived since the last look.
+    pub error_line: Option<String>,
 }
 
 /// The counters carried by one beat.
@@ -334,6 +427,7 @@ impl State {
                     beats: 0,
                     counters: VecDeque::new(),
                     seen_counters: BTreeSet::new(),
+                    passive: PassiveState::default(),
                 };
                 (job.name.clone(), state)
             })
@@ -411,6 +505,55 @@ impl State {
         true
     }
 
+    /// Records what a look at the pidfile found.
+    pub fn record_process(&mut self, job: &str, at: SystemTime, finding: ProcessFinding) -> bool {
+        let Some(state) = self.jobs.get_mut(job) else {
+            return false;
+        };
+
+        if !matches!(finding, ProcessFinding::PidfileMissing) {
+            state.passive.pidfile_ever_seen = true;
+        }
+        if matches!(finding, ProcessFinding::Running { .. }) {
+            state.passive.process_last_running =
+                Some(forward(state.passive.process_last_running, at));
+        }
+        state.passive.process = Some(finding);
+        true
+    }
+
+    /// Records what a look at the log found.
+    pub fn record_log(&mut self, job: &str, at: SystemTime, sample: LogSample) -> bool {
+        let Some(state) = self.jobs.get_mut(job) else {
+            return false;
+        };
+
+        if matches!(sample.finding, FileFinding::Present { .. }) {
+            state.passive.log_ever_seen = true;
+        }
+        if sample.rotated {
+            state.passive.log_rotations += 1;
+        }
+        if let Some(line) = sample.error_line {
+            state.passive.log_last_error = Some(LoggedError { at, line });
+        }
+        state.passive.log = Some(sample.finding);
+        true
+    }
+
+    /// Records what a look at the artifact found.
+    pub fn record_artifact(&mut self, job: &str, finding: FileFinding) -> bool {
+        let Some(state) = self.jobs.get_mut(job) else {
+            return false;
+        };
+
+        if matches!(finding, FileFinding::Present { .. }) {
+            state.passive.artifact_ever_seen = true;
+        }
+        state.passive.artifact = Some(finding);
+        true
+    }
+
     pub fn job(&self, name: &str) -> Option<&JobState> {
         self.jobs.get(name)
     }
@@ -474,6 +617,18 @@ impl SharedState {
     /// Turns on unpruned recording for `learn`.
     pub fn start_journal(&self) {
         self.lock().start_journal();
+    }
+
+    pub fn record_process(&self, job: &str, at: SystemTime, finding: ProcessFinding) -> bool {
+        self.lock().record_process(job, at, finding)
+    }
+
+    pub fn record_log(&self, job: &str, at: SystemTime, sample: LogSample) -> bool {
+        self.lock().record_log(job, at, sample)
+    }
+
+    pub fn record_artifact(&self, job: &str, finding: FileFinding) -> bool {
+        self.lock().record_artifact(job, finding)
     }
 
     /// Runs `f` against the state while holding the lock.

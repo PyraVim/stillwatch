@@ -13,13 +13,17 @@
 //! 3. end with the implication in plain language; never a bare "check failed"
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use async_trait::async_trait;
 
 use crate::config::TelegramConfig;
-use crate::evaluate::{Assessment, Baseline, Condition, LastSeen, Reason, Severity, Trigger};
+use crate::evaluate::{
+    Assessment, Baseline, Condition, FileAbsence, LastSeen, ProcessAbsence, Reason, Severity,
+    Trigger, WatchedFile,
+};
 use crate::fmt;
 
 /// What a notification is about, from the reader's point of view.
@@ -155,6 +159,50 @@ pub fn render(assessment: &Assessment, now: SystemTime) -> Notification {
             beats,
             waiting_for,
         } => render_ratio_unreported(&subject, level, rule, counter, *beats, *waiting_for),
+
+        Reason::ProcessAbsent {
+            absent_for,
+            since,
+            pidfile,
+            detail,
+        } => render_process_absent(&subject, level, *absent_for, since, pidfile, detail, now),
+
+        Reason::FileStale {
+            what,
+            path,
+            stale_for,
+            since,
+            stale_after,
+            rotations,
+        } => render_file_stale(
+            &subject,
+            level,
+            *what,
+            path,
+            *stale_for,
+            since,
+            *stale_after,
+            *rotations,
+            now,
+        ),
+
+        Reason::FileMissing {
+            what,
+            path,
+            missing_for,
+            detail,
+        } => render_file_missing(&subject, level, *what, path, *missing_for, detail),
+
+        Reason::ArtifactTooSmall {
+            path,
+            size,
+            min_bytes,
+            modified,
+        } => render_artifact_too_small(&subject, level, path, *size, *min_bytes, *modified, now),
+
+        Reason::LoggedError { path, at, line } => {
+            render_logged_error(&subject, level, path, *at, line, now)
+        }
 
         Reason::CheckDown {
             failing_for,
@@ -404,6 +452,242 @@ fn render_ratio_unreported(
         icon = level.icon(),
         waited = fmt::duration(waiting_for),
     )
+}
+
+/// Carried inline on every passive alert.
+///
+/// Not just in the README, because nobody reads the README at three in the
+/// morning. A pidfile says a process id exists; a log says bytes were written;
+/// an artifact says a file has a size. None of them says the job did its work,
+/// and somebody who has only ever seen these alerts will otherwise trust them
+/// exactly as much as a heartbeat.
+const WEAKER: &str = "watched from outside · a weaker signal than a heartbeat";
+
+fn render_process_absent(
+    subject: &str,
+    level: Level,
+    absent_for: Duration,
+    since: &LastSeen,
+    pidfile: &Path,
+    detail: &ProcessAbsence,
+    now: SystemTime,
+) -> String {
+    let pidfile = pidfile.display();
+
+    let (headline, evidence, implication) = match detail {
+        ProcessAbsence::ProcessGone { pid } => (
+            format!("{subject} — process {pid} is gone"),
+            format!("{pidfile} still names pid {pid}, but no such process exists"),
+            "→ it exited without cleaning up its pidfile, which usually means it did \
+             not exit on purpose",
+        ),
+        ProcessAbsence::PidfileMissing {
+            existed_before: true,
+        } => (
+            format!("{subject} — the pidfile has gone"),
+            format!("{pidfile} was there and is not any more"),
+            "→ the process shut down, or something cleaned up after it",
+        ),
+        // Never seen at all: a wrong path and a job that never started look
+        // identical from here, so the alert says both rather than picking one.
+        ProcessAbsence::PidfileMissing {
+            existed_before: false,
+        } => (
+            format!("{subject} — no pidfile has ever appeared"),
+            format!("nothing at {pidfile} since the watch began"),
+            "→ either the job has not started since stillwatch did, or the pidfile \
+             path in the config is wrong",
+        ),
+        ProcessAbsence::PidfileUnreadable(why) => (
+            format!("{subject} — the pidfile cannot be read"),
+            format!("{pidfile}: {why}"),
+            "→ this is stillwatch's problem, not the job's: fix the permissions or the \
+             path and the real signal comes back",
+        ),
+    };
+
+    let measured = match since {
+        LastSeen::Observed(last) => format!(
+            "last seen running {}, {} ago",
+            fmt::timestamp(*last, now),
+            fmt::duration(absent_for)
+        ),
+        LastSeen::WatchdogStart(started) => format!(
+            "never seen running since the watch began at {}, {} ago",
+            fmt::timestamp(*started, now),
+            fmt::duration(absent_for)
+        ),
+    };
+
+    format!(
+        "{icon}  {headline}\n\
+         \x20   {evidence}\n\
+         \x20   {measured}\n\
+         \x20   {WEAKER}\n\
+         \x20   {implication}",
+        icon = level.icon(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_file_stale(
+    subject: &str,
+    level: Level,
+    what: WatchedFile,
+    path: &Path,
+    stale_for: Duration,
+    since: &LastSeen,
+    stale_after: Duration,
+    rotations: u64,
+    now: SystemTime,
+) -> String {
+    let last_change = match since {
+        LastSeen::Observed(last) => fmt::timestamp(*last, now),
+        LastSeen::WatchdogStart(started) => fmt::timestamp(*started, now),
+    };
+
+    // A rotation count worth mentioning explains what the tail did and did not
+    // get to read.
+    let rotation_note = match rotations {
+        0 => String::new(),
+        1 => String::from("\n\x20   the file was rotated once while being watched"),
+        n => format!("\n\x20   the file was rotated {n} times while being watched"),
+    };
+
+    let implication = match what {
+        WatchedFile::Log => {
+            "→ the job has written nothing for that long; it is wedged, idle, or logging \
+             somewhere else"
+        }
+        WatchedFile::Artifact => {
+            "→ nothing new has been produced; the run did not happen, or happened and \
+             wrote nowhere"
+        }
+    };
+
+    format!(
+        "{icon}  {subject} — the {noun} has not changed in {stale}\n\
+         \x20   {path}, last written {last_change}, expected within {expected}{rotation_note}\n\
+         \x20   {WEAKER}\n\
+         \x20   {implication}",
+        icon = level.icon(),
+        noun = what.noun(),
+        stale = fmt::duration(stale_for),
+        path = path.display(),
+        expected = fmt::duration(stale_after),
+    )
+}
+
+fn render_file_missing(
+    subject: &str,
+    level: Level,
+    what: WatchedFile,
+    path: &Path,
+    missing_for: Duration,
+    detail: &FileAbsence,
+) -> String {
+    let noun = what.noun();
+    let path = path.display();
+
+    // A file that has never existed and one that vanished send you to different
+    // places, so they never share a message.
+    let (headline, evidence, implication) = match detail {
+        FileAbsence::NotThere {
+            existed_before: true,
+        } => (
+            format!("{subject} — the {noun} has disappeared"),
+            format!("{path} was there and is not any more"),
+            "→ something deleted or moved it; whatever reads it downstream is now \
+             reading nothing",
+        ),
+        FileAbsence::NotThere {
+            existed_before: false,
+        } => (
+            format!("{subject} — the {noun} has never appeared"),
+            format!(
+                "nothing at {path} in the {} since the watch began",
+                fmt::duration(missing_for)
+            ),
+            "→ either it has never been produced, or the path in the config is wrong; \
+             until one of those is true this rule is watching nothing",
+        ),
+        FileAbsence::Unreadable(why) => (
+            format!("{subject} — the {noun} cannot be read"),
+            format!("{path}: {why}"),
+            "→ this is stillwatch's problem, not the job's: fix the permissions and the \
+             real signal comes back",
+        ),
+    };
+
+    format!(
+        "{icon}  {headline}\n\
+         \x20   {evidence}\n\
+         \x20   {WEAKER}\n\
+         \x20   {implication}",
+        icon = level.icon(),
+    )
+}
+
+fn render_artifact_too_small(
+    subject: &str,
+    level: Level,
+    path: &Path,
+    size: u64,
+    min_bytes: u64,
+    modified: Option<SystemTime>,
+    now: SystemTime,
+) -> String {
+    let written = match modified {
+        Some(modified) => format!("written {}", fmt::timestamp(modified, now)),
+        None => String::from("modification time unavailable"),
+    };
+
+    format!(
+        "{icon}  {subject} — the output is being produced but is nearly empty\n\
+         \x20   {path} is {size} bytes, {written}; anything real is at least {min_bytes}\n\
+         \x20   the file is fresh · this is not a stale artifact, it is an empty one\n\
+         \x20   {WEAKER}\n\
+         \x20   → the run completed and wrote almost nothing, which is the failure that \
+         exits zero",
+        icon = level.icon(),
+        path = path.display(),
+        size = fmt::count(size as f64),
+        min_bytes = fmt::count(min_bytes as f64),
+    )
+}
+
+fn render_logged_error(
+    subject: &str,
+    level: Level,
+    path: &Path,
+    at: SystemTime,
+    line: &str,
+    now: SystemTime,
+) -> String {
+    // The job's own words. Truncated only so one enormous line cannot fill the
+    // message.
+    let line = truncate(line, 300);
+
+    format!(
+        "{icon}  {subject} — its log is reporting an error\n\
+         \x20   {path} at {when}:\n\
+         \x20     {line}\n\
+         \x20   the job said this about itself · a stronger signal than the others here\n\
+         \x20   → whatever this says went wrong, went wrong; stillwatch is only \
+         repeating it",
+        icon = level.icon(),
+        path = path.display(),
+        when = fmt::timestamp(at, now),
+    )
+}
+
+fn truncate(line: &str, limit: usize) -> String {
+    let trimmed = line.trim();
+    if trimmed.chars().count() <= limit {
+        return trimmed.to_string();
+    }
+    let kept: String = trimmed.chars().take(limit).collect();
+    format!("{kept}…")
 }
 
 fn render_check_down(
