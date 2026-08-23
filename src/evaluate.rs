@@ -39,6 +39,21 @@ pub enum Reason {
         expect_every: Duration,
     },
 
+    /// The job is running but has not reported doing anything for too long.
+    NoWork {
+        silent_for: Duration,
+        since: LastSeen,
+        warn_after: Duration,
+
+        /// Whether the job is demonstrably still beating.
+        ///
+        /// Load-bearing twice over. It changes what the alert says — a job that
+        /// is looping and producing nothing is the idle-dead case, which reads
+        /// very differently from one that has simply stopped. And it caps the
+        /// severity: a job that is alive and quiet is never a page.
+        alive_and_quiet: bool,
+    },
+
     /// Every probe for at least `down_after` has failed.
     CheckDown {
         failing_for: Duration,
@@ -135,6 +150,7 @@ impl Eq for Trigger {}
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Condition {
     NoHeartbeat,
+    NoWork,
     Down,
     Degraded,
     UntrustworthyBaseline,
@@ -147,6 +163,7 @@ impl Reason {
     pub fn headline(&self) -> String {
         match self {
             Reason::NoHeartbeat { .. } => "no heartbeat".to_string(),
+            Reason::NoWork { .. } => "no work".to_string(),
             Reason::CheckDown { .. } => "down".to_string(),
             Reason::Degraded { .. } => "degraded".to_string(),
             Reason::BaselineNotCredible { .. } => "an untrustworthy baseline".to_string(),
@@ -156,6 +173,7 @@ impl Reason {
     pub fn condition(&self) -> Condition {
         match self {
             Reason::NoHeartbeat { .. } => Condition::NoHeartbeat,
+            Reason::NoWork { .. } => Condition::NoWork,
             Reason::CheckDown { .. } => Condition::Down,
             Reason::Degraded { .. } => Condition::Degraded,
             Reason::BaselineNotCredible { .. } => Condition::UntrustworthyBaseline,
@@ -224,10 +242,10 @@ pub enum CheckHealth {
 /// What the silence is being measured from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LastSeen {
-    /// A beat was seen at this time.
-    Beat(SystemTime),
+    /// The signal was last seen at this time.
+    Observed(SystemTime),
 
-    /// No beat has ever arrived, so the silence is measured from when this
+    /// The signal has never arrived, so the silence is measured from when this
     /// process started watching.
     ///
     /// This is the case that matters: a job that was already dead before
@@ -246,7 +264,7 @@ pub enum LastSeen {
 pub fn evaluate(state: &State, now: SystemTime) -> Vec<Assessment> {
     let jobs = state
         .jobs()
-        .filter_map(|job| assess_alive(job, state.started_at(), now));
+        .flat_map(|job| assess_job(job, state.started_at(), now));
 
     let checks = state
         .checks()
@@ -267,6 +285,83 @@ pub fn check_health(state: &State, now: SystemTime) -> Vec<(String, CheckHealth)
         .collect()
 }
 
+/// Everything currently wrong with one job.
+///
+/// Liveness comes first and, when it is firing, is the *only* thing reported.
+/// A job whose loop has stopped will also stop doing work, stop refreshing its
+/// data and stop moving its counters — reporting all four would be four
+/// messages about one fact, and burying the one that explains the rest.
+fn assess_job(job: &JobState, watch_started: SystemTime, now: SystemTime) -> Vec<Assessment> {
+    if let Some(not_beating) = assess_alive(job, watch_started, now) {
+        return vec![not_beating];
+    }
+
+    // Reaching here with an alive rule configured means the job is beating
+    // within its threshold — which is what makes "alive and quiet" provable
+    // rather than assumed.
+    let alive_and_quiet = job.config.alive.is_some();
+
+    assess_worked(job, watch_started, now, alive_and_quiet)
+        .into_iter()
+        .collect()
+}
+
+fn assess_worked(
+    job: &JobState,
+    watch_started: SystemTime,
+    now: SystemTime,
+    alive_and_quiet: bool,
+) -> Option<Assessment> {
+    let worked = job.config.worked?;
+
+    // The same dead-on-arrival shape as liveness: a job that has never once
+    // reported work has no history to measure from, so the silence is measured
+    // from when the watch began. What it must not do is invent a last-work time,
+    // so the two cases stay distinguishable all the way into the alert.
+    let (since, measured_from) = match job.last_worked {
+        Some(last) => (LastSeen::Observed(last), last),
+        None => (LastSeen::WatchdogStart(watch_started), watch_started),
+    };
+
+    let silent_for = now.duration_since(measured_from).unwrap_or(Duration::ZERO);
+
+    let severity = if worked
+        .critical_after
+        .is_some_and(|critical_after| silent_for >= critical_after)
+    {
+        Severity::Critical
+    } else if silent_for >= worked.warn_after {
+        Severity::Warn
+    } else {
+        return None;
+    };
+
+    // "A job that is alive and quiet must never produce a critical alert on the
+    // `worked` signal alone." A nightly sync that legitimately does nothing for
+    // twenty-three hours is healthy, and the only way to tell that apart from a
+    // crashed loop is the liveness signal — which is currently satisfied. So the
+    // finding stands, but it does not escalate to a page.
+    //
+    // A job with no liveness rule at all is not covered by this: nothing is
+    // vouching for it, so its configured `critical_after` applies in full.
+    let severity = if alive_and_quiet {
+        severity.min(Severity::Warn)
+    } else {
+        severity
+    };
+
+    Some(Assessment {
+        subject: job.name().to_string(),
+        severity,
+        reason: Reason::NoWork {
+            silent_for,
+            since,
+            warn_after: worked.warn_after,
+            alive_and_quiet,
+        },
+    })
+}
+
 fn assess_alive(job: &JobState, watch_started: SystemTime, now: SystemTime) -> Option<Assessment> {
     // No `[job.alive]` block means the job never claimed a cadence, so there is
     // no such thing as it being late. A nightly sync that is legitimately quiet
@@ -275,7 +370,7 @@ fn assess_alive(job: &JobState, watch_started: SystemTime, now: SystemTime) -> O
     let alive = job.config.alive?;
 
     let (since, measured_from) = match job.last_beat {
-        Some(last) => (LastSeen::Beat(last), last),
+        Some(last) => (LastSeen::Observed(last), last),
         None => (LastSeen::WatchdogStart(watch_started), watch_started),
     };
 
@@ -730,7 +825,7 @@ mod tests {
             )
         };
 
-        assert_eq!(*since, LastSeen::Beat(at(5_000)));
+        assert_eq!(*since, LastSeen::Observed(at(5_000)));
         assert_eq!(*silent_for, Duration::from_secs(312));
     }
 
@@ -769,6 +864,229 @@ mod tests {
             severities(&assessments),
             [("product-scraper", Severity::Critical)]
         );
+    }
+
+    // -- the worked signal -------------------------------------------------
+
+    use crate::config::SilenceConfig;
+    use crate::state::BeatDetail;
+
+    fn worked_detail() -> BeatDetail {
+        BeatDetail {
+            worked: Some(true),
+            ..BeatDetail::default()
+        }
+    }
+
+    /// A nightly job: no liveness rule at all, warns at 26h, criticals at 50h.
+    fn nightly_with_worked() -> JobConfig {
+        JobConfig {
+            worked: Some(SilenceConfig {
+                warn_after: Duration::from_secs(26 * 3_600),
+                critical_after: Some(Duration::from_secs(50 * 3_600)),
+            }),
+            ..JobConfig::named("nightly-sync")
+        }
+    }
+
+    /// A continuously-beating job that should also be getting work done.
+    fn scraper_with_worked() -> JobConfig {
+        JobConfig {
+            worked: Some(SilenceConfig {
+                warn_after: Duration::from_secs(2 * 3_600),
+                critical_after: Some(Duration::from_secs(6 * 3_600)),
+            }),
+            ..scraper()
+        }
+    }
+
+    /// The same dead-on-arrival hole as liveness, in the `worked` signal: a job
+    /// that has never once reported work has no history, and treating that as
+    /// "nothing to say" would hide a job that has not run since the watch began.
+    #[test]
+    fn a_job_that_has_never_reported_work_is_measured_from_process_start() {
+        let state = state(&[nightly_with_worked()]);
+
+        assert!(evaluate(&state, at(STARTED + 25 * 3_600)).is_empty());
+
+        let assessments = evaluate(&state, at(STARTED + 27 * 3_600));
+        assert_eq!(assessments.len(), 1);
+
+        let Reason::NoWork {
+            since, silent_for, ..
+        } = &assessments[0].reason
+        else {
+            panic!("expected a no-work reason, got {:?}", assessments[0].reason)
+        };
+        assert_eq!(*since, LastSeen::WatchdogStart(at(STARTED)));
+        assert_eq!(*silent_for, Duration::from_secs(27 * 3_600));
+    }
+
+    /// ...and it says so, rather than implying a last-work time it never saw.
+    #[test]
+    fn a_never_worked_job_is_not_described_as_having_last_worked() {
+        let state = state(&[nightly_with_worked()]);
+        let now = at(STARTED + 27 * 3_600);
+
+        let text = crate::notify::render(&evaluate(&state, now)[0], now).text;
+
+        assert!(
+            !text.contains("last work "),
+            "invented a last-work time: {text}"
+        );
+        assert!(text.contains("since stillwatch started"), "{text}");
+        assert!(text.contains("never been wired up"), "{text}");
+    }
+
+    #[test]
+    fn work_resets_the_silence_and_is_measured_from_it() {
+        let mut state = state(&[nightly_with_worked()]);
+        state.record_beat_with("nightly-sync", at(STARTED + 3_600), &worked_detail());
+
+        assert!(evaluate(&state, at(STARTED + 3_600 + 25 * 3_600)).is_empty());
+
+        let assessments = evaluate(&state, at(STARTED + 3_600 + 27 * 3_600));
+        let Reason::NoWork { since, .. } = &assessments[0].reason else {
+            panic!("expected a no-work reason")
+        };
+        assert_eq!(*since, LastSeen::Observed(at(STARTED + 3_600)));
+    }
+
+    /// A bare beat means the loop ran. It is not a claim that anything was
+    /// accomplished, and treating it as one would collapse the two signals.
+    #[test]
+    fn beats_without_worked_true_do_not_count_as_work() {
+        let mut state = state(&[nightly_with_worked()]);
+        for hour in 0..30 {
+            state.record_beat("nightly-sync", at(STARTED + hour * 3_600));
+        }
+
+        let assessments = evaluate(&state, at(STARTED + 27 * 3_600));
+        assert_eq!(assessments.len(), 1, "beating is not working");
+        assert!(matches!(assessments[0].reason, Reason::NoWork { .. }));
+    }
+
+    #[test]
+    fn worked_false_is_an_explicit_statement_that_nothing_happened() {
+        let mut state = state(&[nightly_with_worked()]);
+        state.record_beat_with(
+            "nightly-sync",
+            at(STARTED + 3_600),
+            &BeatDetail {
+                worked: Some(false),
+                ..BeatDetail::default()
+            },
+        );
+
+        let assessments = evaluate(&state, at(STARTED + 27 * 3_600));
+        assert_eq!(assessments.len(), 1);
+    }
+
+    // -- alive and quiet must never page ----------------------------------
+
+    /// The test that proves the tool understands the problem, in its second
+    /// form. A job that is demonstrably beating and simply has nothing to do is
+    /// a warning at most, however long the quiet runs.
+    #[test]
+    fn a_job_that_is_alive_and_quiet_never_goes_critical_on_worked_alone() {
+        let mut state = state(&[scraper_with_worked()]);
+
+        // Beating faithfully for a day, doing nothing at all.
+        let mut t = STARTED;
+        while t <= STARTED + 24 * 3_600 {
+            state.record_beat("product-scraper", at(t));
+            t += 60;
+        }
+
+        let now = at(STARTED + 24 * 3_600);
+        let assessments = evaluate(&state, now);
+
+        assert_eq!(assessments.len(), 1);
+        assert_eq!(
+            assessments[0].severity,
+            Severity::Warn,
+            "24h past a 6h critical threshold, but the loop is provably alive: \
+             a quiet worked signal is a warn at most"
+        );
+    }
+
+    /// The cap applies only when something is actually vouching for the loop.
+    /// A job with no liveness rule has nothing standing behind it, so its
+    /// configured critical threshold means what it says.
+    #[test]
+    fn a_job_with_no_liveness_rule_still_goes_critical_on_worked() {
+        let state = state(&[nightly_with_worked()]);
+
+        let assessments = evaluate(&state, at(STARTED + 51 * 3_600));
+
+        assert_eq!(assessments.len(), 1);
+        assert_eq!(assessments[0].severity, Severity::Critical);
+    }
+
+    #[test]
+    fn an_alive_and_quiet_alert_says_the_loop_is_still_running() {
+        let mut state = state(&[scraper_with_worked()]);
+        let mut t = STARTED;
+        while t <= STARTED + 3 * 3_600 {
+            state.record_beat("product-scraper", at(t));
+            t += 60;
+        }
+        // One real piece of work early on, so there is a last-work time.
+        state.record_beat_with("product-scraper", at(STARTED + 60), &worked_detail());
+
+        let now = at(STARTED + 3 * 3_600);
+        let text = crate::notify::render(&evaluate(&state, now)[0], now).text;
+
+        assert!(text.contains("still beating"), "{text}");
+        assert!(text.contains("idle-dead"), "{text}");
+        assert!(text.contains("last work"), "{text}");
+    }
+
+    /// A job beating steadily that has *never* reported work is the sharpest
+    /// form of idle-dead. Telling the reader "it has not run" would be flatly
+    /// wrong — it plainly has.
+    #[test]
+    fn a_beating_job_that_never_worked_is_not_described_as_never_having_run() {
+        let mut state = state(&[scraper_with_worked()]);
+        let mut t = STARTED;
+        while t <= STARTED + 3 * 3_600 {
+            state.record_beat("product-scraper", at(t));
+            t += 60;
+        }
+
+        let now = at(STARTED + 3 * 3_600);
+        let text = crate::notify::render(&evaluate(&state, now)[0], now).text;
+
+        assert!(text.contains("still beating"), "{text}");
+        assert!(
+            text.contains("looping since the watch began"),
+            "must not claim a beating job has not run: {text}"
+        );
+        assert!(!text.contains("has not run since"), "{text}");
+    }
+
+    // -- one dead job is one message ---------------------------------------
+
+    /// A job whose loop has stopped will also stop working. Reporting both
+    /// would be two messages about one fact, with the explanatory one buried.
+    #[test]
+    fn a_stopped_loop_suppresses_the_worked_signal() {
+        let mut state = state(&[scraper_with_worked()]);
+        state.record_beat_with("product-scraper", at(STARTED), &worked_detail());
+
+        // Long past both the alive and the worked thresholds.
+        let assessments = evaluate(&state, at(STARTED + 8 * 3_600));
+
+        assert_eq!(assessments.len(), 1, "{assessments:?}");
+        assert!(matches!(assessments[0].reason, Reason::NoHeartbeat { .. }));
+    }
+
+    #[test]
+    fn a_job_with_no_worked_block_is_never_judged_on_work() {
+        let mut state = state(&[nightly()]);
+        state.record_beat("nightly-sync", at(STARTED));
+
+        assert!(evaluate(&state, at(STARTED + 365 * 24 * 3_600)).is_empty());
     }
 
     // -- checks: fixtures --------------------------------------------------

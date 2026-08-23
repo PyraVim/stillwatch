@@ -118,6 +118,21 @@ pub fn render(assessment: &Assessment, now: SystemTime) -> Notification {
             expect_every,
         } => render_no_heartbeat(&subject, level, *silent_for, since, *expect_every, now),
 
+        Reason::NoWork {
+            silent_for,
+            since,
+            warn_after,
+            alive_and_quiet,
+        } => render_no_work(
+            &subject,
+            level,
+            *silent_for,
+            since,
+            *warn_after,
+            *alive_and_quiet,
+            now,
+        ),
+
         Reason::CheckDown {
             failing_for,
             failed_probes,
@@ -177,7 +192,7 @@ fn render_no_heartbeat(
     let every = fmt::duration(expect_every);
 
     match since {
-        LastSeen::Beat(last) => format!(
+        LastSeen::Observed(last) => format!(
             "{icon}  {subject} — no heartbeat for {silent}\n\
              \x20   last beat {last}, expected every {every}\n\
              \x20   stillwatch has been up for the whole gap — this is the job, not the watchdog\n\
@@ -198,6 +213,71 @@ fn render_no_heartbeat(
             silent = fmt::duration(silent_for),
             started = fmt::timestamp(*started, now),
         ),
+    }
+}
+
+fn render_no_work(
+    subject: &str,
+    level: Level,
+    silent_for: Duration,
+    since: &LastSeen,
+    warn_after: Duration,
+    alive_and_quiet: bool,
+    now: SystemTime,
+) -> String {
+    let expected = fmt::duration(warn_after);
+
+    // Ruling the loop in or out is the whole difference between "the schedule
+    // never fired" and "it is running and accomplishing nothing".
+    let context = if alive_and_quiet {
+        "still beating · the loop is running, it just has not reported any work"
+    } else {
+        "no liveness rule on this job, so nothing is vouching for the loop either"
+    };
+
+    match since {
+        LastSeen::Observed(last) => {
+            let implication = if alive_and_quiet {
+                "→ this is the idle-dead case: up, looping, and producing nothing"
+            } else {
+                "→ the schedule did not fire, or it fired and died before doing anything"
+            };
+
+            format!(
+                "{icon}  {subject} — no work in {silent}\n\
+                 \x20   last work {last}, expected at least every {expected}\n\
+                 \x20   {context}\n\
+                 \x20   {implication}",
+                icon = level.icon(),
+                silent = fmt::duration(silent_for),
+                last = fmt::timestamp(*last, now),
+            )
+        }
+
+        // Never claim a last-work time that was never observed. A job that has
+        // been beating since the watch began and has *still* never reported
+        // work is the sharpest form of idle-dead, so saying "it has not run"
+        // here would be flatly wrong — it plainly has.
+        LastSeen::WatchdogStart(started) => {
+            let implication = if alive_and_quiet {
+                "→ it has been looping since the watch began without once reporting work: \
+                 idle-dead, or never wired up to report worked:true"
+            } else {
+                "→ either it has not run since the watch began, or it has never been \
+                 wired up to report worked:true"
+            };
+
+            format!(
+                "{icon}  {subject} — no work since stillwatch started, {silent} ago\n\
+                 \x20   watching since {started}, expected work at least every {expected}; \
+                 none has ever been reported\n\
+                 \x20   {context}\n\
+                 \x20   {implication}",
+                icon = level.icon(),
+                silent = fmt::duration(silent_for),
+                started = fmt::timestamp(*started, now),
+            )
+        }
     }
 }
 
@@ -665,7 +745,7 @@ mod tests {
             &no_heartbeat(
                 "product-scraper",
                 Severity::Warn,
-                LastSeen::Beat(now - Duration::from_secs(312)),
+                LastSeen::Observed(now - Duration::from_secs(312)),
                 312,
             ),
             now,
@@ -695,7 +775,7 @@ mod tests {
             &no_heartbeat(
                 "clients-etl",
                 Severity::Critical,
-                LastSeen::Beat(now - Duration::from_secs(900)),
+                LastSeen::Observed(now - Duration::from_secs(900)),
                 900,
             ),
             now,
@@ -750,7 +830,7 @@ mod tests {
     fn every_alert_ends_with_an_implication() {
         let now = at(1_755_000_000);
         for since in [
-            LastSeen::Beat(now - Duration::from_secs(400)),
+            LastSeen::Observed(now - Duration::from_secs(400)),
             LastSeen::WatchdogStart(now - Duration::from_secs(400)),
         ] {
             let notification = render(
@@ -1085,7 +1165,7 @@ mod tests {
         no_heartbeat(
             subject,
             severity,
-            LastSeen::Beat(at(1_000) - Duration::from_secs(silent_secs)),
+            LastSeen::Observed(at(1_000) - Duration::from_secs(silent_secs)),
             silent_secs,
         )
     }
