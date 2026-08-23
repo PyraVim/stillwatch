@@ -7,7 +7,7 @@
 
 use std::time::{Duration, SystemTime};
 
-use crate::config::DegradationConfig;
+use crate::config::{DegradationConfig, RatioConfig};
 use crate::state::{percentile, CheckState, JobState, Observation, Outcome, State};
 
 /// The percentile latency is judged at, for both the baseline and the current
@@ -22,7 +22,7 @@ pub enum Severity {
 }
 
 /// One thing that is wrong, right now.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Assessment {
     /// The job this is about. Alerts lead with it, never with a check id.
     pub subject: String,
@@ -30,7 +30,11 @@ pub struct Assessment {
     pub reason: Reason,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// `Eq` rather than derived, because a reason can carry counter totals and
+/// ratios, and `f64` is only `PartialEq`. Every such value here originates from
+/// a counter the receiver has already refused to accept unless finite, so
+/// reflexivity holds in practice.
+#[derive(Debug, Clone, PartialEq)]
 pub enum Reason {
     NoHeartbeat {
         /// How long the silence has lasted, measured from `since`.
@@ -71,6 +75,33 @@ pub enum Reason {
         watching_since: SystemTime,
         waiting_for: Duration,
         beats: u64,
+    },
+
+    /// A counter ratio has fallen below its floor.
+    RatioBelowMin {
+        rule: String,
+        numerator: String,
+        denominator: String,
+        numerator_total: f64,
+        denominator_total: f64,
+        ratio: f64,
+        min: f64,
+        window: Duration,
+
+        /// What the operator asked to be told, if they said.
+        message: Option<String>,
+    },
+
+    /// A ratio rule names a counter that has never once arrived.
+    ///
+    /// Almost always a typo in the config or a counter the job was never
+    /// changed to emit. Either way the rule is inert, which from outside is
+    /// indistinguishable from a rule that is passing.
+    RatioCounterNeverReported {
+        rule: String,
+        counter: String,
+        beats: u64,
+        waiting_for: Duration,
     },
 
     /// Every probe for at least `down_after` has failed.
@@ -160,6 +191,9 @@ pub enum Trigger {
 
 impl Eq for Trigger {}
 
+impl Eq for Reason {}
+impl Eq for Assessment {}
+
 /// What an incident is *about*, independent of its severity or detail.
 ///
 /// This is half the deduplication key, alongside the subject. One subject can
@@ -172,6 +206,10 @@ pub enum Condition {
     NoWork,
     Stale,
     FreshnessUnreported,
+    /// Keyed by rule name: a job may carry several ratio rules, and each is its
+    /// own incident.
+    Ratio(String),
+    RatioUnreported(String),
     Down,
     Degraded,
     UntrustworthyBaseline,
@@ -187,6 +225,8 @@ impl Reason {
             Reason::NoWork { .. } => "no work".to_string(),
             Reason::Stale { .. } => "stale data".to_string(),
             Reason::FreshnessNeverReported { .. } => "a freshness rule with no data".to_string(),
+            Reason::RatioBelowMin { rule, .. } => format!("a low {rule}"),
+            Reason::RatioCounterNeverReported { rule, .. } => format!("{rule} with no data"),
             Reason::CheckDown { .. } => "down".to_string(),
             Reason::Degraded { .. } => "degraded".to_string(),
             Reason::BaselineNotCredible { .. } => "an untrustworthy baseline".to_string(),
@@ -199,6 +239,10 @@ impl Reason {
             Reason::NoWork { .. } => Condition::NoWork,
             Reason::Stale { .. } => Condition::Stale,
             Reason::FreshnessNeverReported { .. } => Condition::FreshnessUnreported,
+            Reason::RatioBelowMin { rule, .. } => Condition::Ratio(rule.clone()),
+            Reason::RatioCounterNeverReported { rule, .. } => {
+                Condition::RatioUnreported(rule.clone())
+            }
             Reason::CheckDown { .. } => Condition::Down,
             Reason::Degraded { .. } => Condition::Degraded,
             Reason::BaselineNotCredible { .. } => Condition::UntrustworthyBaseline,
@@ -329,7 +373,156 @@ fn assess_job(job: &JobState, watch_started: SystemTime, now: SystemTime) -> Vec
     let mut findings = Vec::new();
     findings.extend(assess_worked(job, watch_started, now, alive_and_quiet));
     findings.extend(assess_freshness(job, watch_started, now));
+    for rule in &job.config.ratios {
+        findings.extend(assess_ratio(job, rule, watch_started, now));
+    }
     findings
+}
+
+/// What a ratio rule adds up to over its window.
+struct RatioTotals {
+    numerator: f64,
+    denominator: f64,
+}
+
+/// Sums a rule's counters over its window.
+///
+/// Only beats carrying the *denominator* contribute. The denominator is the
+/// "attempts" side, so a beat that never mentions it has nothing to say about
+/// the rule; within a beat that does, a missing numerator genuinely means none
+/// — a scrape that fetched 20 pages and reports no `parsed` count parsed zero.
+fn ratio_totals(job: &JobState, rule: &RatioConfig, now: SystemTime) -> RatioTotals {
+    let mut totals = RatioTotals {
+        numerator: 0.0,
+        denominator: 0.0,
+    };
+
+    for sample in job.counter_window(rule.window, now) {
+        let Some(denominator) = sample.counters.get(&rule.denominator) else {
+            continue;
+        };
+        totals.denominator += denominator;
+        totals.numerator += sample.counters.get(&rule.numerator).copied().unwrap_or(0.0);
+    }
+
+    totals
+}
+
+/// Why a ratio rule is not currently being judged, if it is not.
+///
+/// Returns `None` when the rule *is* being judged. Public so the daemon can
+/// report it: a rule that is silently inert looks exactly like a rule that is
+/// passing, and the difference is the whole point.
+pub fn ratio_not_judged(job: &JobState, rule: &RatioConfig, now: SystemTime) -> Option<Unjudged> {
+    if !job.has_ever_seen(&rule.denominator) {
+        return Some(Unjudged::NeverReported);
+    }
+
+    let totals = ratio_totals(job, rule, now);
+    if totals.denominator < rule.min_sample as f64 {
+        return Some(Unjudged::Warming {
+            have: totals.denominator as u64,
+            needed: rule.min_sample,
+        });
+    }
+
+    None
+}
+
+fn assess_ratio(
+    job: &JobState,
+    rule: &RatioConfig,
+    watch_started: SystemTime,
+    now: SystemTime,
+) -> Option<Assessment> {
+    // A counter that has never once arrived is a different problem from one
+    // that is simply quiet: it means the rule names something the job does not
+    // emit, so it will never fire no matter what happens.
+    if !job.has_ever_seen(&rule.denominator) {
+        let waiting_for = now.duration_since(watch_started).unwrap_or(Duration::ZERO);
+        if job.beats > 0 && waiting_for >= rule.window {
+            return Some(Assessment {
+                subject: job.name().to_string(),
+                severity: Severity::Warn,
+                reason: Reason::RatioCounterNeverReported {
+                    rule: rule.name.clone(),
+                    counter: rule.denominator.clone(),
+                    beats: job.beats,
+                    waiting_for,
+                },
+            });
+        }
+        return None;
+    }
+
+    let totals = ratio_totals(job, rule, now);
+
+    // Below `min_sample` the rule has no verdict. Not healthy — unjudged. This
+    // is also what makes the division below safe: `min_sample` is at least 1,
+    // so a denominator of zero can never reach it.
+    if totals.denominator < rule.min_sample as f64 {
+        return None;
+    }
+
+    let ratio = totals.numerator / totals.denominator;
+    if ratio >= rule.min {
+        return None;
+    }
+
+    Some(Assessment {
+        subject: job.name().to_string(),
+        severity: Severity::Warn,
+        reason: Reason::RatioBelowMin {
+            rule: rule.name.clone(),
+            numerator: rule.numerator.clone(),
+            denominator: rule.denominator.clone(),
+            numerator_total: totals.numerator,
+            denominator_total: totals.denominator,
+            ratio,
+            min: rule.min,
+            window: rule.window,
+            message: rule.message.clone(),
+        },
+    })
+}
+
+/// A rule that currently has no verdict, and why.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnjudgedSignal {
+    pub subject: String,
+    pub signal: String,
+    pub why: Unjudged,
+}
+
+/// Every job rule that is configured but not currently reaching a conclusion.
+///
+/// These are not incidents and must not page. But a reader has to be able to
+/// find out that a rule they configured is not actually judging anything,
+/// because from outside that is indistinguishable from everything being fine.
+pub fn unjudged_signals(state: &State, now: SystemTime) -> Vec<UnjudgedSignal> {
+    let mut out = Vec::new();
+
+    for job in state.jobs() {
+        if job.config.freshness.is_some() && job.last_data_ts.is_none() {
+            out.push(UnjudgedSignal {
+                subject: job.name().to_string(),
+                signal: "freshness".to_string(),
+                why: Unjudged::NeverReported,
+            });
+        }
+
+        for rule in &job.config.ratios {
+            if let Some(why) = ratio_not_judged(job, rule, now) {
+                out.push(UnjudgedSignal {
+                    subject: job.name().to_string(),
+                    signal: rule.name.clone(),
+                    why,
+                });
+            }
+        }
+    }
+
+    out
 }
 
 /// How stale the data the job is acting on has become.
@@ -1339,6 +1532,340 @@ mod tests {
         let conditions: Vec<_> = assessments.iter().map(|a| a.reason.condition()).collect();
 
         assert_eq!(conditions, [Condition::NoWork, Condition::Stale]);
+    }
+
+    // -- counter ratios ----------------------------------------------------
+
+    fn parse_rate(min_sample: u64) -> RatioConfig {
+        RatioConfig {
+            name: "parse rate".into(),
+            numerator: "parsed".into(),
+            denominator: "fetched".into(),
+            window: Duration::from_secs(3_600),
+            min: 0.9,
+            min_sample,
+            message: Some("fetching fine, parsing broken — source markup likely changed".into()),
+        }
+    }
+
+    fn scraper_with_ratio(min_sample: u64) -> JobConfig {
+        JobConfig {
+            ratios: vec![parse_rate(min_sample)],
+            ..JobConfig::named("product-scraper")
+        }
+    }
+
+    fn counts(pairs: &[(&str, f64)]) -> BeatDetail {
+        BeatDetail {
+            counters: pairs
+                .iter()
+                .map(|(name, value)| (name.to_string(), *value))
+                .collect(),
+            ..BeatDetail::default()
+        }
+    }
+
+    /// Below `min_sample` the rule has no verdict. Not passing — unjudged.
+    #[test]
+    fn a_ratio_below_min_sample_never_fires() {
+        let mut state = state(&[scraper_with_ratio(50)]);
+
+        // A catastrophic rate, on far too little evidence to say so.
+        state.record_beat_with(
+            "product-scraper",
+            at(STARTED + 60),
+            &counts(&[("fetched", 4.0), ("parsed", 0.0)]),
+        );
+
+        assert!(
+            evaluate(&state, at(STARTED + 120)).is_empty(),
+            "4 samples cannot condemn a rule that asked for 50"
+        );
+    }
+
+    /// ...and it is reported as unjudged rather than left to look healthy.
+    #[test]
+    fn a_ratio_below_min_sample_is_reported_as_not_yet_judged() {
+        let mut state = state(&[scraper_with_ratio(50)]);
+        state.record_beat_with(
+            "product-scraper",
+            at(STARTED + 60),
+            &counts(&[("fetched", 4.0), ("parsed", 4.0)]),
+        );
+
+        let unjudged = unjudged_signals(&state, at(STARTED + 120));
+        assert_eq!(unjudged.len(), 1);
+        assert_eq!(unjudged[0].signal, "parse rate");
+        assert_eq!(
+            unjudged[0].why,
+            Unjudged::Warming {
+                have: 4,
+                needed: 50
+            }
+        );
+    }
+
+    /// The denominator being zero is the one way a ratio could divide by zero.
+    /// It is answered explicitly — as unjudged — and never reaches the division.
+    #[test]
+    fn a_zero_denominator_is_unjudged_not_a_division() {
+        let mut state = state(&[scraper_with_ratio(1)]);
+
+        // The scraper ran and fetched nothing at all. There is no parse rate.
+        for tick in 1..=20 {
+            state.record_beat_with(
+                "product-scraper",
+                at(STARTED + tick * 60),
+                &counts(&[("fetched", 0.0), ("parsed", 0.0)]),
+            );
+        }
+
+        let now = at(STARTED + 1_260);
+        assert!(
+            evaluate(&state, now).is_empty(),
+            "nothing was attempted, so nothing failed"
+        );
+
+        let unjudged = unjudged_signals(&state, now);
+        assert_eq!(
+            unjudged[0].why,
+            Unjudged::Warming { have: 0, needed: 1 },
+            "a zero denominator is not a zero rate"
+        );
+    }
+
+    #[test]
+    fn a_ratio_at_or_above_its_floor_is_not_an_alert() {
+        let mut state = state(&[scraper_with_ratio(50)]);
+        for tick in 1..=10 {
+            state.record_beat_with(
+                "product-scraper",
+                at(STARTED + tick * 60),
+                &counts(&[("fetched", 120.0), ("parsed", 118.0)]),
+            );
+        }
+
+        assert!(evaluate(&state, at(STARTED + 700)).is_empty());
+        assert!(unjudged_signals(&state, at(STARTED + 700)).is_empty());
+    }
+
+    /// The spec's headline case: fetching is fine, parsing is broken, and every
+    /// beat is arriving on time.
+    #[test]
+    fn a_collapsed_ratio_with_enough_evidence_fires() {
+        let mut state = state(&[scraper_with_ratio(50)]);
+        for tick in 1..=10 {
+            state.record_beat_with(
+                "product-scraper",
+                at(STARTED + tick * 60),
+                &counts(&[("fetched", 120.0), ("parsed", 49.0)]),
+            );
+        }
+
+        let now = at(STARTED + 700);
+        let assessments = evaluate(&state, now);
+        assert_eq!(assessments.len(), 1);
+        assert_eq!(assessments[0].severity, Severity::Warn);
+
+        let Reason::RatioBelowMin {
+            ratio,
+            numerator_total,
+            denominator_total,
+            ..
+        } = &assessments[0].reason
+        else {
+            panic!("expected a ratio reason, got {:?}", assessments[0].reason)
+        };
+        assert_eq!(*denominator_total, 1_200.0);
+        assert_eq!(*numerator_total, 490.0);
+        assert!((*ratio - 0.4083).abs() < 0.001, "{ratio}");
+    }
+
+    #[test]
+    fn a_ratio_alert_carries_the_operators_own_message() {
+        let mut state = state(&[scraper_with_ratio(50)]);
+        for tick in 1..=10 {
+            state.record_beat_with(
+                "product-scraper",
+                at(STARTED + tick * 60),
+                &counts(&[("fetched", 120.0), ("parsed", 49.0)]),
+            );
+        }
+
+        let now = at(STARTED + 700);
+        let text = crate::notify::render(&evaluate(&state, now)[0], now).text;
+
+        assert!(text.contains("parse rate 40.8% (min 90%)"), "{text}");
+        assert!(text.contains("1,200 fetched"), "{text}");
+        assert!(text.contains("490 parsed"), "{text}");
+        assert!(text.contains("markup likely changed"), "{text}");
+        assert!(
+            text.contains("the loop is running"),
+            "an alert must rule something out: {text}"
+        );
+    }
+
+    /// A beat that reports attempts but no successes counted zero successes.
+    #[test]
+    fn a_missing_numerator_in_a_beat_that_has_the_denominator_counts_as_none() {
+        let mut state = state(&[scraper_with_ratio(50)]);
+        for tick in 1..=10 {
+            state.record_beat_with(
+                "product-scraper",
+                at(STARTED + tick * 60),
+                &counts(&[("fetched", 120.0)]),
+            );
+        }
+
+        let assessments = evaluate(&state, at(STARTED + 700));
+        let Reason::RatioBelowMin { ratio, .. } = &assessments[0].reason else {
+            panic!("expected a ratio reason")
+        };
+        assert_eq!(*ratio, 0.0);
+    }
+
+    /// A rule naming a counter that never arrives is inert, and inert is
+    /// indistinguishable from passing unless somebody says so.
+    #[test]
+    fn a_ratio_naming_a_counter_that_never_arrives_is_reported() {
+        let mut state = state(&[JobConfig {
+            ratios: vec![RatioConfig {
+                denominator: "fetchd".into(),
+                ..parse_rate(50)
+            }],
+            ..JobConfig::named("product-scraper")
+        }]);
+
+        for tick in 1..=80 {
+            state.record_beat_with(
+                "product-scraper",
+                at(STARTED + tick * 60),
+                &counts(&[("fetched", 120.0), ("parsed", 118.0)]),
+            );
+        }
+
+        let now = at(STARTED + 4_900);
+        let assessments = evaluate(&state, now);
+        assert_eq!(assessments.len(), 1);
+
+        let Reason::RatioCounterNeverReported { counter, .. } = &assessments[0].reason else {
+            panic!(
+                "expected an unreported-counter reason, got {:?}",
+                assessments[0].reason
+            )
+        };
+        assert_eq!(counter, "fetchd");
+
+        let text = crate::notify::render(&assessments[0], now).text;
+        assert!(text.contains("never arrives"), "{text}");
+        assert!(text.contains("can never fire"), "{text}");
+    }
+
+    #[test]
+    fn a_ratio_is_not_condemned_before_its_window_has_even_elapsed() {
+        let mut state = state(&[scraper_with_ratio(50)]);
+        state.record_beat("product-scraper", at(STARTED + 60));
+
+        assert!(
+            evaluate(&state, at(STARTED + 120)).is_empty(),
+            "two minutes into a one-hour window is not evidence of anything"
+        );
+    }
+
+    #[test]
+    fn counters_outside_the_window_do_not_count() {
+        let mut state = state(&[scraper_with_ratio(50)]);
+
+        // A bad hour, then a good one.
+        for tick in 1..=10 {
+            state.record_beat_with(
+                "product-scraper",
+                at(STARTED + tick * 60),
+                &counts(&[("fetched", 120.0), ("parsed", 10.0)]),
+            );
+        }
+        for tick in 70..=110 {
+            state.record_beat_with(
+                "product-scraper",
+                at(STARTED + tick * 60),
+                &counts(&[("fetched", 120.0), ("parsed", 119.0)]),
+            );
+        }
+
+        assert!(
+            evaluate(&state, at(STARTED + 110 * 60)).is_empty(),
+            "the bad hour has rolled out of the window"
+        );
+    }
+
+    /// Two rules on one job are two independent findings.
+    #[test]
+    fn two_ratio_rules_are_assessed_separately() {
+        let mut state = state(&[JobConfig {
+            ratios: vec![
+                parse_rate(50),
+                RatioConfig {
+                    name: "store rate".into(),
+                    numerator: "stored".into(),
+                    denominator: "parsed".into(),
+                    ..parse_rate(50)
+                },
+            ],
+            ..JobConfig::named("product-scraper")
+        }]);
+
+        for tick in 1..=10 {
+            state.record_beat_with(
+                "product-scraper",
+                at(STARTED + tick * 60),
+                &counts(&[("fetched", 120.0), ("parsed", 49.0), ("stored", 10.0)]),
+            );
+        }
+
+        let assessments = evaluate(&state, at(STARTED + 700));
+        let conditions: Vec<_> = assessments.iter().map(|a| a.reason.condition()).collect();
+
+        assert_eq!(
+            conditions,
+            [
+                Condition::Ratio("parse rate".into()),
+                Condition::Ratio("store rate".into())
+            ]
+        );
+    }
+
+    #[test]
+    fn a_job_with_no_ratio_rules_never_produces_one() {
+        let mut state = state(&[nightly()]);
+        state.record_beat_with(
+            "nightly-sync",
+            at(STARTED),
+            &counts(&[("rows_read", 8_400.0), ("rows_written", 0.0)]),
+        );
+
+        assert!(evaluate(&state, at(STARTED + 10_000)).is_empty());
+    }
+
+    /// A stopped loop explains a collapsed ratio; reporting both would bury the
+    /// one that matters.
+    #[test]
+    fn a_stopped_loop_suppresses_ratio_findings() {
+        let mut state = state(&[JobConfig {
+            ratios: vec![parse_rate(50)],
+            ..scraper()
+        }]);
+
+        for tick in 1..=10 {
+            state.record_beat_with(
+                "product-scraper",
+                at(STARTED + tick * 60),
+                &counts(&[("fetched", 120.0), ("parsed", 10.0)]),
+            );
+        }
+
+        let assessments = evaluate(&state, at(STARTED + 3_000));
+        assert_eq!(assessments.len(), 1);
+        assert!(matches!(assessments[0].reason, Reason::NoHeartbeat { .. }));
     }
 
     // -- checks: fixtures --------------------------------------------------

@@ -59,6 +59,52 @@ pub fn latency(d: Duration) -> String {
     duration(d)
 }
 
+/// Renders a counter total the way it would be written down.
+///
+/// `1,204`, `494`, `0.5`. Counters are `f64` because the protocol lets a job
+/// send whatever it counts, but almost all of them are whole numbers and
+/// rendering `1204.0000001` in an alert helps nobody.
+pub fn count(value: f64) -> String {
+    if !value.is_finite() {
+        return value.to_string();
+    }
+    if value.fract() != 0.0 || value.abs() >= 1e15 {
+        return format!("{value:.1}");
+    }
+
+    let whole = format!("{:.0}", value.abs());
+    let mut out = String::with_capacity(whole.len() + whole.len() / 3);
+    for (index, digit) in whole.chars().enumerate() {
+        if index > 0 && (whole.len() - index) % 3 == 0 {
+            out.push(',');
+        }
+        out.push(digit);
+    }
+
+    if value.is_sign_negative() && value != 0.0 {
+        format!("-{out}")
+    } else {
+        out
+    }
+}
+
+/// Renders a fraction as a percentage: `41%`, `90%`, `99.5%`.
+///
+/// A ratio rule is configured as a fraction and read as a percentage, so the
+/// alert speaks the reader's units rather than the config file's.
+pub fn percent(fraction: f64) -> String {
+    if !fraction.is_finite() {
+        return fraction.to_string();
+    }
+
+    let scaled = fraction * 100.0;
+    if (scaled - scaled.round()).abs() < 0.05 {
+        format!("{:.0}%", scaled.round())
+    } else {
+        format!("{scaled:.1}%")
+    }
+}
+
 /// Renders a wall-clock timestamp in local time, always with a UTC offset.
 ///
 /// Same day as `now` gives `14:32:07 -04:00`; anything older carries the date
@@ -129,6 +175,30 @@ mod tests {
     #[test]
     fn latency_falls_back_to_duration_past_a_minute() {
         assert_eq!(latency(Duration::from_secs(90)), "1m30s");
+    }
+
+    #[test]
+    fn counts_are_grouped_the_way_they_are_written_down() {
+        assert_eq!(count(1_204.0), "1,204");
+        assert_eq!(count(494.0), "494");
+        assert_eq!(count(0.0), "0");
+        assert_eq!(count(1_000_000.0), "1,000,000");
+        assert_eq!(count(12_345.0), "12,345");
+    }
+
+    #[test]
+    fn a_fractional_count_keeps_a_decimal() {
+        assert_eq!(count(0.5), "0.5");
+        assert_eq!(count(1_204.25), "1204.2");
+    }
+
+    #[test]
+    fn fractions_read_as_percentages() {
+        assert_eq!(percent(0.41), "41%");
+        assert_eq!(percent(0.9), "90%");
+        assert_eq!(percent(1.0), "100%");
+        assert_eq!(percent(0.995), "99.5%");
+        assert_eq!(percent(0.0), "0%");
     }
 
     #[test]

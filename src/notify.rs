@@ -147,6 +147,15 @@ pub fn render(assessment: &Assessment, now: SystemTime) -> Notification {
             render_freshness_unreported(&subject, level, *watching_since, *waiting_for, *beats, now)
         }
 
+        Reason::RatioBelowMin { .. } => render_ratio(&subject, level, &assessment.reason),
+
+        Reason::RatioCounterNeverReported {
+            rule,
+            counter,
+            beats,
+            waiting_for,
+        } => render_ratio_unreported(&subject, level, rule, counter, *beats, *waiting_for),
+
         Reason::CheckDown {
             failing_for,
             failed_probes,
@@ -331,6 +340,68 @@ fn render_freshness_unreported(
          data_ts with the beat or drop the [job.freshness] block",
         icon = level.icon(),
         since = fmt::timestamp(watching_since, now),
+        waited = fmt::duration(waiting_for),
+    )
+}
+
+/// The spec's headline ratio alert: what the rate is, the raw counts behind it,
+/// what is demonstrably fine, and what the operator asked to be told.
+fn render_ratio(subject: &str, level: Level, reason: &Reason) -> String {
+    let Reason::RatioBelowMin {
+        rule,
+        numerator,
+        denominator,
+        numerator_total,
+        denominator_total,
+        ratio,
+        min,
+        window,
+        message,
+    } = reason
+    else {
+        return String::new();
+    };
+
+    // The operator's own words when they wrote them, because they know what the
+    // counters mean and this tool deliberately does not.
+    let implication = match message {
+        Some(message) => format!("→ {message}"),
+        None => format!(
+            "→ {denominator} is happening and {numerator} is not keeping up; the step \
+             between them is where to look"
+        ),
+    };
+
+    format!(
+        "{icon}  {subject} — {rule} {actual} (min {floor})\n\
+         \x20   last {window}: {denominator_total_fmt} {denominator}, \
+         {numerator_total_fmt} {numerator}\n\
+         \x20   beats arriving ✓ · the loop is running, the work is not landing\n\
+         \x20   {implication}",
+        icon = level.icon(),
+        actual = fmt::percent(*ratio),
+        floor = fmt::percent(*min),
+        window = fmt::duration(*window),
+        denominator_total_fmt = fmt::count(*denominator_total),
+        numerator_total_fmt = fmt::count(*numerator_total),
+    )
+}
+
+fn render_ratio_unreported(
+    subject: &str,
+    level: Level,
+    rule: &str,
+    counter: &str,
+    beats: u64,
+    waiting_for: Duration,
+) -> String {
+    format!(
+        "{icon}  {subject} — {rule} is configured against a counter that never arrives\n\
+         \x20   {beats} beats in {waited}, not one carrying {counter:?}\n\
+         \x20   nothing has failed this rule · it has never been able to run\n\
+         \x20   → check the counter name against what the job actually sends; as it \
+         stands this rule can never fire",
+        icon = level.icon(),
         waited = fmt::duration(waiting_for),
     )
 }
