@@ -140,6 +140,36 @@ impl Reason {
     }
 }
 
+/// Why a rule has no verdict yet.
+///
+/// One vocabulary for every signal in the tool, because it is one idea: a rule
+/// that cannot yet reach a conclusion is *not* a rule that concluded everything
+/// is fine. Silence caused by missing data and silence caused by good health
+/// look identical from outside, so they are never represented the same way here
+/// and never reported the same way to a reader.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Unjudged {
+    /// The signal has never been reported at all.
+    ///
+    /// Distinct from "not enough of it yet": nothing is on its way. Usually it
+    /// means the job was never wired up to send it, or the config names a
+    /// counter that does not exist.
+    NeverReported,
+
+    /// Reported, but there is not yet enough of it to conclude anything.
+    Warming { have: u64, needed: u64 },
+}
+
+impl Unjudged {
+    /// A phrase that completes "not judged: ...".
+    pub fn describe(&self) -> String {
+        match self {
+            Unjudged::NeverReported => "never reported".to_string(),
+            Unjudged::Warming { have, needed } => format!("{have} of {needed} so far"),
+        }
+    }
+}
+
 /// What a reader needs to know about whether a check is actually being judged.
 ///
 /// The spec called for three states. There are four, because conflating "not
@@ -150,10 +180,7 @@ impl Reason {
 pub enum CheckHealth {
     /// Responding, but the baseline is not yet usable — only the ceiling is
     /// being applied.
-    Warming {
-        samples: usize,
-        needed: usize,
-    },
+    NotJudged(Unjudged),
 
     Ok,
 
@@ -413,7 +440,10 @@ fn assess_check(check: &CheckState, now: SystemTime) -> (CheckHealth, Option<Ass
 
 fn health_without_verdict(baseline: Baseline) -> CheckHealth {
     match baseline {
-        Baseline::Warming { samples, needed } => CheckHealth::Warming { samples, needed },
+        Baseline::Warming { samples, needed } => CheckHealth::NotJudged(Unjudged::Warming {
+            have: samples as u64,
+            needed: needed as u64,
+        }),
         _ => CheckHealth::Ok,
     }
 }
@@ -812,7 +842,7 @@ mod tests {
         assert!(
             matches!(
                 health_of(&state, "vendor-api", now),
-                CheckHealth::Warming { needed: 30, .. }
+                CheckHealth::NotJudged(Unjudged::Warming { needed: 30, .. })
             ),
             "got {:?}",
             health_of(&state, "vendor-api", now)
@@ -827,10 +857,10 @@ mod tests {
         assert!(evaluate(&state, now).is_empty());
         assert_eq!(
             health_of(&state, "vendor-api", now),
-            CheckHealth::Warming {
-                samples: 0,
+            CheckHealth::NotJudged(Unjudged::Warming {
+                have: 0,
                 needed: 30
-            }
+            })
         );
     }
 

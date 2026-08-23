@@ -10,7 +10,7 @@ use std::time::{Duration, SystemTime};
 
 use async_trait::async_trait;
 use stillwatch::config::Config;
-use stillwatch::evaluate::{check_health, evaluate, CheckHealth};
+use stillwatch::evaluate::{check_health, evaluate, CheckHealth, Unjudged};
 use stillwatch::notify::{Dispatcher, Level, Notification, Notifier, NotifyError};
 use stillwatch::state::{Observation, Outcome, SharedState, State};
 
@@ -222,7 +222,7 @@ async fn a_check_is_not_judged_on_multiples_until_its_baseline_exists() {
     assert!(
         matches!(
             health(&state, "vendor-api", START + 600),
-            CheckHealth::Warming { needed: 30, .. }
+            CheckHealth::NotJudged(Unjudged::Warming { needed: 30, .. })
         ),
         "a check with no baseline is warming, not ok: {:?}",
         health(&state, "vendor-api", START + 600)

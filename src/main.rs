@@ -164,11 +164,10 @@ fn report_check_health(
         }
 
         match &health {
-            CheckHealth::Warming { samples, needed } => tracing::info!(
+            CheckHealth::NotJudged(why) => tracing::info!(
                 check = %name,
-                samples,
-                needed,
-                "warming up; judged against the ceiling only until the baseline fills"
+                why = %why.describe(),
+                "not judged on latency yet; the ceiling still applies"
             ),
             CheckHealth::Ok => tracing::info!(check = %name, "ok"),
             CheckHealth::OkWithStaleBaseline {
