@@ -34,6 +34,17 @@ pub enum Reason {
     },
 }
 
+impl Reason {
+    /// A few words naming the condition, reused verbatim in the all-clear so
+    /// that "recovered — no heartbeat for 18m4s" lines up with the alert that
+    /// opened the incident.
+    pub fn headline(&self) -> &'static str {
+        match self {
+            Reason::NoHeartbeat { .. } => "no heartbeat",
+        }
+    }
+}
+
 /// What the silence is being measured from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LastSeen {

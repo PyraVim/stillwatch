@@ -12,6 +12,8 @@
 //!    woken up
 //! 3. end with the implication in plain language; never a bare "check failed"
 
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use async_trait::async_trait;
@@ -75,6 +77,20 @@ pub enum NotifyError {
         status: u16,
         detail: String,
     },
+}
+
+impl NotifyError {
+    /// Whether retrying this message could ever succeed.
+    ///
+    /// A wrong chat id or a malformed request will be refused identically
+    /// forever, and retrying it blocks every alert queued behind it. A timeout,
+    /// a 5xx or a rate limit will not.
+    fn is_permanent(&self) -> bool {
+        match self {
+            NotifyError::Transport { .. } => false,
+            NotifyError::Rejected { status, .. } => (400..500).contains(status) && *status != 429,
+        }
+    }
 }
 
 /// Somewhere an alert can go.
@@ -147,6 +163,212 @@ pub fn render_recovery(subject: &str, headline: &str, lasted: Duration) -> Notif
             lasted = fmt::duration(lasted),
         ),
     }
+}
+
+// ---------------------------------------------------------------------------
+// dispatch: dedup, escalation, recovery, retry
+// ---------------------------------------------------------------------------
+
+/// How long to wait before the first delivery retry. Doubles from here.
+const BASE_RETRY: Duration = Duration::from_secs(5);
+
+/// Retries never back off further than this — a notifier that comes back after
+/// an hour should not leave alerts sitting for another hour.
+const MAX_RETRY: Duration = Duration::from_secs(300);
+
+/// Dedup bounds the outbox to a few entries per subject in normal operation.
+/// This cap only matters if a subject flaps for a long time while the notifier
+/// is unreachable, and exists so that months of uptime cannot turn into
+/// unbounded memory.
+const MAX_OUTBOX: usize = 512;
+
+/// An incident that has been reported and has not yet cleared.
+#[derive(Debug)]
+struct Open {
+    /// The worst severity reported so far. Escalation is one-way: once someone
+    /// has been told it is critical, dropping back to warn is not news.
+    severity: Severity,
+
+    /// When the incident started — the *first* alert, not the escalation, so
+    /// the all-clear reports the whole outage.
+    opened_at: SystemTime,
+
+    headline: &'static str,
+}
+
+/// Turns a stream of per-cycle assessments into the alerts a person actually
+/// receives.
+///
+/// This is where monitoring tools usually fail, so it is deliberately the
+/// fussiest part of the codebase:
+///
+/// * **deduplicated** — one alert per incident, not one per evaluation cycle
+/// * **escalating** — warn, then critical, then nothing; it does not nag
+/// * **recovering** — every alert gets an all-clear with the duration
+/// * **never silently dropped** — undelivered alerts queue in order and retry
+///   with backoff
+pub struct Dispatcher {
+    notifier: Arc<dyn Notifier>,
+    open: BTreeMap<String, Open>,
+
+    /// Rendered but undelivered, oldest first. Order is preserved so that a
+    /// recovery can never overtake the alert it resolves.
+    outbox: VecDeque<Notification>,
+
+    consecutive_failures: u32,
+    retry_at: Option<SystemTime>,
+    dropped: u64,
+}
+
+impl Dispatcher {
+    pub fn new(notifier: Arc<dyn Notifier>) -> Self {
+        Self {
+            notifier,
+            open: BTreeMap::new(),
+            outbox: VecDeque::new(),
+            consecutive_failures: 0,
+            retry_at: None,
+            dropped: 0,
+        }
+    }
+
+    /// Takes one full evaluation cycle and sends whatever is genuinely new.
+    ///
+    /// `assessments` must be everything currently wrong; a subject that is open
+    /// and absent from this slice is treated as recovered.
+    pub async fn dispatch(&mut self, assessments: &[Assessment], now: SystemTime) {
+        self.reconcile(assessments, now);
+        self.flush(now).await;
+    }
+
+    /// Number of alerts rendered but not yet delivered.
+    pub fn undelivered(&self) -> usize {
+        self.outbox.len()
+    }
+
+    /// Number of incidents currently open.
+    pub fn open_incidents(&self) -> usize {
+        self.open.len()
+    }
+
+    /// Decides what is new. Pure with respect to the network — it only queues.
+    fn reconcile(&mut self, assessments: &[Assessment], now: SystemTime) {
+        let mut queued = Vec::new();
+
+        let still_wrong: BTreeSet<&str> = assessments.iter().map(|a| a.subject.as_str()).collect();
+        let recovered: Vec<String> = self
+            .open
+            .keys()
+            .filter(|subject| !still_wrong.contains(subject.as_str()))
+            .cloned()
+            .collect();
+
+        for subject in recovered {
+            if let Some(open) = self.open.remove(&subject) {
+                let lasted = now.duration_since(open.opened_at).unwrap_or(Duration::ZERO);
+                queued.push(render_recovery(&subject, open.headline, lasted));
+            }
+        }
+
+        for assessment in assessments {
+            match self.open.get_mut(&assessment.subject) {
+                // Already reported at this severity or worse. Saying it again
+                // every cycle is how alerting gets muted.
+                Some(open) if assessment.severity <= open.severity => {}
+
+                // Escalation: warn became critical. Worth one more message,
+                // and the incident keeps its original start time.
+                Some(open) => {
+                    open.severity = assessment.severity;
+                    queued.push(render(assessment, now));
+                }
+
+                None => {
+                    self.open.insert(
+                        assessment.subject.clone(),
+                        Open {
+                            severity: assessment.severity,
+                            opened_at: now,
+                            headline: assessment.reason.headline(),
+                        },
+                    );
+                    queued.push(render(assessment, now));
+                }
+            }
+        }
+
+        for notification in queued {
+            self.enqueue(notification);
+        }
+    }
+
+    fn enqueue(&mut self, notification: Notification) {
+        if self.outbox.len() >= MAX_OUTBOX {
+            if let Some(lost) = self.outbox.pop_front() {
+                self.dropped += 1;
+                tracing::error!(
+                    subject = %lost.subject,
+                    dropped_total = self.dropped,
+                    "outbox is full; dropping the oldest undelivered alert"
+                );
+            }
+        }
+        self.outbox.push_back(notification);
+    }
+
+    /// Delivers what is queued, in order, stopping at the first failure that is
+    /// worth retrying.
+    async fn flush(&mut self, now: SystemTime) {
+        if self.retry_at.is_some_and(|retry_at| now < retry_at) {
+            return;
+        }
+
+        while let Some(notification) = self.outbox.front().cloned() {
+            match self.notifier.send(&notification).await {
+                Ok(()) => {
+                    self.outbox.pop_front();
+                    self.consecutive_failures = 0;
+                    self.retry_at = None;
+                    tracing::info!(
+                        subject = %notification.subject,
+                        level = ?notification.level,
+                        "alert sent"
+                    );
+                }
+
+                Err(err) if err.is_permanent() => {
+                    // Retrying forever would block every alert behind it, so
+                    // this one goes — loudly, and with the reason attached.
+                    self.outbox.pop_front();
+                    self.dropped += 1;
+                    tracing::error!(
+                        subject = %notification.subject,
+                        error = %err,
+                        "dropping an alert the notifier will never accept; fix the config"
+                    );
+                }
+
+                Err(err) => {
+                    self.consecutive_failures += 1;
+                    let delay = backoff(self.consecutive_failures);
+                    self.retry_at = Some(now + delay);
+                    tracing::error!(
+                        subject = %notification.subject,
+                        error = %err,
+                        queued = self.outbox.len(),
+                        retry_in = %fmt::duration(delay),
+                        "could not deliver an alert; it stays queued"
+                    );
+                    return;
+                }
+            }
+        }
+    }
+}
+
+fn backoff(consecutive_failures: u32) -> Duration {
+    let doublings = consecutive_failures.saturating_sub(1).min(8);
+    (BASE_RETRY * (1u32 << doublings)).min(MAX_RETRY)
 }
 
 // ---------------------------------------------------------------------------
@@ -373,6 +595,347 @@ mod tests {
             let last = notification.text.lines().last().unwrap_or_default();
             assert!(last.trim_start().starts_with('→'), "{last}");
         }
+    }
+
+    // -- dispatch ----------------------------------------------------------
+
+    /// A notifier that records what it was given and can be told to reject
+    /// everything with a chosen status until it is repaired.
+    #[derive(Default)]
+    struct Fake {
+        sent: std::sync::Mutex<Vec<Notification>>,
+        rejecting_with: std::sync::Mutex<Option<u16>>,
+        attempts: std::sync::atomic::AtomicUsize,
+    }
+
+    impl Fake {
+        fn shared() -> Arc<Self> {
+            Arc::new(Self::default())
+        }
+
+        fn break_with(&self, status: u16) {
+            *self.rejecting_with.lock().expect("lock") = Some(status);
+        }
+
+        fn repair(&self) {
+            *self.rejecting_with.lock().expect("lock") = None;
+        }
+
+        fn delivered(&self) -> Vec<Notification> {
+            self.sent.lock().expect("lock").clone()
+        }
+
+        fn levels(&self) -> Vec<Level> {
+            self.delivered().iter().map(|n| n.level).collect()
+        }
+
+        fn attempts(&self) -> usize {
+            self.attempts.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait]
+    impl Notifier for Fake {
+        async fn send(&self, notification: &Notification) -> Result<(), NotifyError> {
+            self.attempts
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+
+            // Read the guard out in its own statement: an `if let` scrutinee
+            // holds its temporaries for the whole block in edition 2021, which
+            // would deadlock against the second lock below.
+            let rejecting_with = *self.rejecting_with.lock().expect("lock");
+            if let Some(status) = rejecting_with {
+                return Err(NotifyError::Rejected {
+                    channel: self.channel(),
+                    status,
+                    detail: "injected by the test".into(),
+                });
+            }
+
+            self.sent.lock().expect("lock").push(notification.clone());
+            Ok(())
+        }
+
+        fn channel(&self) -> &'static str {
+            "fake"
+        }
+    }
+
+    fn silent(subject: &str, severity: Severity, silent_secs: u64) -> Assessment {
+        no_heartbeat(
+            subject,
+            severity,
+            LastSeen::Beat(at(1_000) - Duration::from_secs(silent_secs)),
+            silent_secs,
+        )
+    }
+
+    #[tokio::test]
+    async fn the_same_condition_alerts_once_not_once_per_cycle() {
+        let fake = Fake::shared();
+        let mut dispatcher = Dispatcher::new(fake.clone());
+        let warn = [silent("product-scraper", Severity::Warn, 312)];
+
+        for tick in 0..20 {
+            dispatcher.dispatch(&warn, at(2_000 + tick * 5)).await;
+        }
+
+        assert_eq!(fake.delivered().len(), 1, "one alert per incident");
+        assert_eq!(fake.levels(), [Level::Warn]);
+    }
+
+    #[tokio::test]
+    async fn warn_escalates_to_critical_exactly_once() {
+        let fake = Fake::shared();
+        let mut dispatcher = Dispatcher::new(fake.clone());
+
+        for tick in 0..5 {
+            dispatcher
+                .dispatch(
+                    &[silent("product-scraper", Severity::Warn, 312)],
+                    at(2_000 + tick),
+                )
+                .await;
+        }
+        for tick in 0..5 {
+            dispatcher
+                .dispatch(
+                    &[silent("product-scraper", Severity::Critical, 950)],
+                    at(2_100 + tick),
+                )
+                .await;
+        }
+
+        assert_eq!(fake.levels(), [Level::Warn, Level::Critical]);
+    }
+
+    /// Warn, then critical, then nothing. It does not nag, and it does not
+    /// walk back down either.
+    #[tokio::test]
+    async fn dropping_back_to_warn_is_not_a_new_alert() {
+        let fake = Fake::shared();
+        let mut dispatcher = Dispatcher::new(fake.clone());
+
+        dispatcher
+            .dispatch(&[silent("clients-etl", Severity::Critical, 950)], at(2_000))
+            .await;
+        dispatcher
+            .dispatch(&[silent("clients-etl", Severity::Warn, 312)], at(2_005))
+            .await;
+
+        assert_eq!(fake.levels(), [Level::Critical]);
+    }
+
+    #[tokio::test]
+    async fn every_alert_gets_an_all_clear_with_the_full_incident_duration() {
+        let fake = Fake::shared();
+        let mut dispatcher = Dispatcher::new(fake.clone());
+
+        dispatcher
+            .dispatch(&[silent("product-scraper", Severity::Warn, 312)], at(2_000))
+            .await;
+        dispatcher
+            .dispatch(
+                &[silent("product-scraper", Severity::Critical, 950)],
+                at(2_500),
+            )
+            .await;
+        dispatcher.dispatch(&[], at(2_000 + 1_084)).await;
+
+        assert_eq!(
+            fake.levels(),
+            [Level::Warn, Level::Critical, Level::Recovered]
+        );
+        // Measured from the first alert, not the escalation.
+        assert_eq!(
+            fake.delivered()[2].text,
+            "✅  product-scraper recovered — no heartbeat for 18m4s"
+        );
+        assert_eq!(dispatcher.open_incidents(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_fresh_incident_after_a_recovery_alerts_again() {
+        let fake = Fake::shared();
+        let mut dispatcher = Dispatcher::new(fake.clone());
+        let warn = [silent("nightly-sync", Severity::Warn, 312)];
+
+        dispatcher.dispatch(&warn, at(2_000)).await;
+        dispatcher.dispatch(&[], at(2_100)).await;
+        dispatcher.dispatch(&warn, at(2_200)).await;
+
+        assert_eq!(
+            fake.levels(),
+            [Level::Warn, Level::Recovered, Level::Warn],
+            "dedup must not swallow the next real incident"
+        );
+    }
+
+    #[tokio::test]
+    async fn nothing_wrong_sends_nothing() {
+        let fake = Fake::shared();
+        let mut dispatcher = Dispatcher::new(fake.clone());
+
+        for tick in 0..10 {
+            dispatcher.dispatch(&[], at(2_000 + tick)).await;
+        }
+
+        assert!(fake.delivered().is_empty());
+        assert_eq!(fake.attempts(), 0);
+    }
+
+    #[tokio::test]
+    async fn subjects_do_not_interfere_with_each_other() {
+        let fake = Fake::shared();
+        let mut dispatcher = Dispatcher::new(fake.clone());
+
+        dispatcher
+            .dispatch(
+                &[
+                    silent("nightly-sync", Severity::Warn, 312),
+                    silent("product-scraper", Severity::Warn, 312),
+                ],
+                at(2_000),
+            )
+            .await;
+        // Only the scraper is still wrong.
+        dispatcher
+            .dispatch(&[silent("product-scraper", Severity::Warn, 400)], at(2_100))
+            .await;
+
+        let subjects: Vec<_> = fake
+            .delivered()
+            .iter()
+            .map(|n| (n.subject.clone(), n.level))
+            .collect();
+
+        assert_eq!(
+            subjects,
+            [
+                ("nightly-sync".to_string(), Level::Warn),
+                ("product-scraper".to_string(), Level::Warn),
+                ("nightly-sync".to_string(), Level::Recovered),
+            ]
+        );
+    }
+
+    // -- delivery failures -------------------------------------------------
+
+    #[tokio::test]
+    async fn an_unreachable_notifier_queues_and_loses_nothing() {
+        let fake = Fake::shared();
+        fake.break_with(503);
+        let mut dispatcher = Dispatcher::new(fake.clone());
+        let warn = [silent("product-scraper", Severity::Warn, 312)];
+
+        dispatcher.dispatch(&warn, at(2_000)).await;
+        assert!(fake.delivered().is_empty());
+        assert_eq!(dispatcher.undelivered(), 1);
+
+        // Backoff holds it briefly, then it retries and gets through.
+        fake.repair();
+        dispatcher.dispatch(&warn, at(2_001)).await;
+        assert!(
+            fake.delivered().is_empty(),
+            "backoff should still be holding"
+        );
+
+        dispatcher.dispatch(&warn, at(2_010)).await;
+
+        assert_eq!(fake.levels(), [Level::Warn], "the alert must not be lost");
+        assert_eq!(dispatcher.undelivered(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_retry_delivers_exactly_one_copy() {
+        let fake = Fake::shared();
+        fake.break_with(500);
+        let mut dispatcher = Dispatcher::new(fake.clone());
+        let warn = [silent("clients-etl", Severity::Warn, 312)];
+
+        for tick in 0..30 {
+            if tick == 15 {
+                fake.repair();
+            }
+            dispatcher.dispatch(&warn, at(2_000 + tick * 10)).await;
+        }
+
+        assert_eq!(fake.delivered().len(), 1, "no duplicate on retry");
+        assert_eq!(dispatcher.undelivered(), 0);
+    }
+
+    #[tokio::test]
+    async fn backoff_grows_rather_than_hammering_every_cycle() {
+        let fake = Fake::shared();
+        fake.break_with(503);
+        let mut dispatcher = Dispatcher::new(fake.clone());
+        let warn = [silent("product-scraper", Severity::Warn, 312)];
+
+        // One evaluation cycle a second for a minute against a dead notifier.
+        for tick in 0..60 {
+            dispatcher.dispatch(&warn, at(2_000 + tick)).await;
+        }
+
+        assert!(
+            fake.attempts() < 10,
+            "expected backoff to throttle retries, saw {} attempts",
+            fake.attempts()
+        );
+        assert_eq!(dispatcher.undelivered(), 1);
+    }
+
+    /// A wrong chat id fails the same way forever. Retrying it would block
+    /// every later alert behind it, so it is dropped — loudly, not silently.
+    #[tokio::test]
+    async fn a_permanently_rejected_alert_does_not_block_the_queue() {
+        let fake = Fake::shared();
+        fake.break_with(400);
+        let mut dispatcher = Dispatcher::new(fake.clone());
+
+        dispatcher
+            .dispatch(&[silent("product-scraper", Severity::Warn, 312)], at(2_000))
+            .await;
+
+        assert!(fake.delivered().is_empty());
+        assert_eq!(
+            dispatcher.undelivered(),
+            0,
+            "a 400 will be refused identically forever; it must not sit in the \
+             queue holding up everything behind it"
+        );
+
+        fake.repair();
+        dispatcher.dispatch(&[], at(2_010)).await;
+
+        assert_eq!(
+            fake.levels(),
+            [Level::Recovered],
+            "later alerts must still get through"
+        );
+    }
+
+    #[tokio::test]
+    async fn rate_limiting_is_retried_rather_than_dropped() {
+        let fake = Fake::shared();
+        fake.break_with(429);
+        let mut dispatcher = Dispatcher::new(fake.clone());
+        let warn = [silent("product-scraper", Severity::Warn, 312)];
+
+        dispatcher.dispatch(&warn, at(2_000)).await;
+        assert_eq!(dispatcher.undelivered(), 1);
+
+        fake.repair();
+        dispatcher.dispatch(&warn, at(2_060)).await;
+
+        assert_eq!(fake.levels(), [Level::Warn]);
+    }
+
+    #[test]
+    fn backoff_doubles_and_then_stops() {
+        assert_eq!(backoff(1), Duration::from_secs(5));
+        assert_eq!(backoff(2), Duration::from_secs(10));
+        assert_eq!(backoff(3), Duration::from_secs(20));
+        assert_eq!(backoff(50), MAX_RETRY);
     }
 
     #[test]
