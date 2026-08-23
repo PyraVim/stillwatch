@@ -11,19 +11,25 @@ health check, still using memory. It just stopped beating.
 
 ## What it does today
 
-One HTTP endpoint. Your job posts to it each time round its loop:
+**Heartbeats.** One HTTP endpoint. Your job posts to it each time round its loop:
 
 ```bash
 curl -fsS -X POST localhost:9111/beat/nightly-sync
 ```
 
 If the beats stop for longer than you said they should, you get a message that
-tells you what happened, what *isn't* wrong, and what it probably means. If they
-start again, you get an all-clear with the duration. One message per incident,
-not one per check cycle.
+tells you what happened, what *isn't* wrong, and what it probably means.
 
-That's the whole of version 0.1. The rest of the plan is in [Roadmap](#roadmap),
-and none of it is built yet.
+**Dependency probes.** stillwatch polls the things your jobs depend on and
+watches their latency against their *own* recent normal — because a dependency
+that has always taken 400ms is fine, and one that took 90ms an hour ago is not.
+It catches the API that still returns 200 on every request and now takes 1.4s.
+
+Either way you get one message per incident, not one per evaluation cycle, and
+an all-clear with the duration when it ends.
+
+That's version 0.1. The rest of the plan is in [Roadmap](#roadmap), and none of
+it is built yet.
 
 ---
 
@@ -49,8 +55,9 @@ The failures worth catching are the ones where the job is up and wrong:
 | **Working but not landing** | Every attempt fails. Process healthy, dependencies healthy, output zero. |
 | **Degraded, not down** | An API that answered in 90ms now takes 1.4s. Still 200 OK. Every check passes. Everything gets slower and nobody is told. |
 
-Version 0.1 catches the case where the loop stops entirely. The other three are
-what the roadmap is for, and they're the reason this is being built at all.
+Version 0.1 catches the first — the loop stopping entirely — and the last, where
+a dependency gets slower and slower while every health check keeps passing. The
+middle two are what the roadmap is for.
 
 ---
 
@@ -139,6 +146,20 @@ name = "product-scraper"
 # No [job.alive] block, so it is never judged late.
 [[job]]
 name = "nightly-sync"
+
+# --- a dependency, probed directly ---
+[[check]]
+name     = "vendor-api"
+type     = "http"                          # or "jsonrpc", which also needs `method`
+url      = "https://api.vendor.com/health"
+interval = "30s"
+timeout  = "3s"
+
+  [check.degradation]
+  baseline_window   = "1h"
+  warn_multiple     = 3.0                  # p90 three times its own recent normal
+  critical_multiple = 8.0
+  absolute_ceiling  = "2s"                 # unacceptable regardless of the baseline
 ```
 
 A minimal working config is four lines — everything but job names has a default.
@@ -177,6 +198,39 @@ See [`stillwatch.toml.example`](stillwatch.toml.example) for the annotated versi
 
 ---
 
+## A baseline is only worth what it learned
+
+Comparing a dependency against its own history is the right idea and it has two
+failure modes, both of which end with the tool being confidently wrong. Both are
+handled deliberately.
+
+**A baseline it hasn't got yet.** Until a check has `min_samples` probes (30 by
+default), there is nothing to compare against. It reports **warming up** — not
+*ok* — and startup logs say how long the wait will be. "Not being judged yet" and
+"healthy" are different facts and stillwatch never conflates them. A
+`baseline_window` too short to ever hold that many probes at that `interval` is
+rejected at startup rather than warming up forever.
+
+**A baseline that learned the wrong thing.** If stillwatch starts while a
+dependency is *already* slow, the baseline learns that slow is normal and the
+multiples never fire again. That's the tool quietly failing, which is worse than
+not having it.
+
+So `absolute_ceiling` is not a second opinion — it's a floor. It's evaluated
+independently of the baseline, and before any baseline exists, so it fires on a
+dependency that has been unacceptable since the moment stillwatch started. The
+baseline p90 also deliberately excludes the most recent stretch, so a slowdown
+still in progress doesn't get to teach the baseline that it's fine. And if the
+baseline itself ends up at or above the ceiling, that gets its own alert saying
+the check has stopped protecting you.
+
+One limit worth stating plainly: a baseline poisoned to a value *below* the
+ceiling is still invisible. Learned at 1.4s with a 2s ceiling, nothing catches
+it. Set `absolute_ceiling` to what you actually consider unacceptable, not to
+some extreme.
+
+---
+
 ## What the alerts look like
 
 ```
@@ -190,7 +244,25 @@ See [`stillwatch.toml.example`](stillwatch.toml.example) for the annotated versi
     → either the job was already stopped when the watch began, or it has never
       been wired up to send beats
 
+🔴  vendor-api — degraded
+    p90 1.2s over the last 20s (6 probes), baseline 96ms over the 1m before that (12 probes)
+    still responding · this is latency, not an outage
+    → 12.5x its own normal; everything downstream is that much slower and nothing
+      else would have said so
+
+⚠️  vendor-api — degraded
+    p90 3s over the last 10m (20 probes), baseline 3s over 118 probes — but that is
+    itself past the 2s ceiling, so the baseline has learned that slow is normal and
+    the multiples cannot fire
+    still responding · this is latency, not an outage
+    → past the 2s you said was unacceptable; everything downstream is waiting that long
+
+🔴  queue-broker — down for 2m4s
+    4 probes in a row failed; the last said: connection refused
+    → whatever depends on this is not getting answers, not getting slow answers
+
 ✅  product-scraper recovered — no heartbeat for 20m5s
+✅  vendor-api recovered — degraded for 18m4s
 ```
 
 Three rules, and they're deliberate:
@@ -258,8 +330,8 @@ whether today's version is worth adopting anyway.
 
 | | |
 |-|-|
-| **Dependency probes** | Poll an HTTP or JSON-RPC dependency on its own interval, with latency percentiles and degradation measured against its *own* recent baseline — never a fixed number. A dependency that has always taken 400ms is fine; one that took 90ms an hour ago is not. |
 | **Freshness, `worked`, counter ratios** | Evaluate the other half of the heartbeat: how stale the data is, whether real work is happening, and generic named-counter rules (`parsed / fetched`, `rows_written / rows_read`, `landed / submitted` — same machinery, no domain knowledge). |
+| **Job → dependency links** | Today a job alert can't say "the scraper is down, not its dependency", because nothing in the config associates a job with the checks it relies on. Needs something like `depends_on = ["vendor-api"]`. |
 | **`learn` mode** | `stillwatch learn --job x --for 6h` observes without alerting, then emits a config block with the evidence behind every number. Nobody knows their job's real cadence, and a watchdog with wrong thresholds either pages constantly until muted or never fires. |
 | **`--dry-run`** | Evaluate live and log what it *would* have sent. People need to watch it be right for a day before trusting it with their phone. |
 | **Passive mode** | Watch something you can't modify: a pidfile, a log that should still be moving, an output file that should still be appearing. Weaker signals than a heartbeat, and the docs will say so — but "I can watch this today without touching your code" is what makes it usable on day one. |
