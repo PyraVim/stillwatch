@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::io;
 use std::net::SocketAddr;
@@ -9,7 +9,7 @@ use std::time::{Duration, SystemTime};
 
 use clap::Parser;
 use stillwatch::config::{self, Config, ConfigError, SystemEnv};
-use stillwatch::evaluate::{check_health, evaluate, CheckHealth};
+use stillwatch::evaluate::{check_health, evaluate, unjudged_signals, CheckHealth, UnjudgedSignal};
 use stillwatch::notify::{Dispatcher, LogOnly, Notifier, Telegram};
 use stillwatch::state::{SharedState, State};
 use stillwatch::{fmt, prober, receiver};
@@ -134,18 +134,57 @@ async fn watch(state: SharedState, mut dispatcher: Dispatcher) {
     ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
 
     let mut reported: BTreeMap<String, CheckHealth> = BTreeMap::new();
+    let mut reported_unjudged: BTreeSet<(String, String)> = BTreeSet::new();
 
     loop {
         ticker.tick().await;
         let now = SystemTime::now();
 
         // The lock is released before any awaiting happens.
-        let (assessments, health) =
-            state.read(|state| (evaluate(state, now), check_health(state, now)));
+        let (assessments, health, unjudged) = state.read(|state| {
+            (
+                evaluate(state, now),
+                check_health(state, now),
+                unjudged_signals(state, now),
+            )
+        });
 
         report_check_health(&mut reported, health);
+        report_unjudged(&mut reported_unjudged, unjudged);
         dispatcher.dispatch(&assessments, now).await;
     }
+}
+
+/// Logs each job rule that is configured but reaching no conclusion.
+///
+/// None of these is an incident and none of them pages. They are here because a
+/// rule that is silently not judging anything looks exactly like a rule that is
+/// passing, and a reader has to be able to tell the two apart without reading
+/// the source.
+fn report_unjudged(reported: &mut BTreeSet<(String, String)>, current: Vec<UnjudgedSignal>) {
+    let now: BTreeSet<(String, String)> = current
+        .iter()
+        .map(|signal| (signal.subject.clone(), signal.signal.clone()))
+        .collect();
+
+    for signal in &current {
+        let key = (signal.subject.clone(), signal.signal.clone());
+        if reported.contains(&key) {
+            continue;
+        }
+        tracing::info!(
+            job = %signal.subject,
+            rule = %signal.signal,
+            why = %signal.why.describe(),
+            "configured but not judging anything yet"
+        );
+    }
+
+    for (subject, signal) in reported.difference(&now) {
+        tracing::info!(job = %subject, rule = %signal, "now being judged");
+    }
+
+    *reported = now;
 }
 
 /// Logs each check's verdict basis whenever it changes.
@@ -212,6 +251,37 @@ fn describe(config: &Config) {
                 job = %job.name,
                 "no [job.alive] block; not watching for missed beats"
             ),
+        }
+
+        if let Some(worked) = &job.worked {
+            tracing::info!(
+                job = %job.name,
+                warn_after = %fmt::duration(worked.warn_after),
+                critical_after = worked.critical_after.map(fmt::duration),
+                capped_at_warn = job.alive.is_some(),
+                "watching for real work; a job that is alive and quiet is never a page"
+            );
+        }
+
+        if let Some(freshness) = &job.freshness {
+            tracing::info!(
+                job = %job.name,
+                warn_after = %fmt::duration(freshness.warn_after),
+                critical_after = freshness.critical_after.map(fmt::duration),
+                "watching data freshness; beats must carry data_ts for this to judge anything"
+            );
+        }
+
+        for ratio in &job.ratios {
+            tracing::info!(
+                job = %job.name,
+                rule = %ratio.name,
+                counters = %format!("{} / {}", ratio.numerator, ratio.denominator),
+                window = %fmt::duration(ratio.window),
+                min = %fmt::percent(ratio.min),
+                min_sample = ratio.min_sample,
+                "watching a counter ratio"
+            );
         }
     }
 
