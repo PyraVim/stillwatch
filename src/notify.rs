@@ -624,10 +624,23 @@ impl Dispatcher {
             .map(|a| (a.subject.clone(), a.reason.condition()))
             .collect();
 
+        // A job whose heartbeat has stopped has its other rules suppressed by
+        // the evaluator, because a dead loop explains all of them. That absence
+        // must not be read as recovery: a collapsed parse rate on a job that
+        // has since died did not get better, and saying it did would be exactly
+        // the confidently-wrong message this whole module exists to avoid. Hold
+        // those incidents open, silently, until the job is judgeable again.
+        let unjudgeable: BTreeSet<&str> = assessments
+            .iter()
+            .filter(|a| a.reason.condition() == Condition::NoHeartbeat)
+            .map(|a| a.subject.as_str())
+            .collect();
+
         let recovered: Vec<IncidentKey> = self
             .open
             .keys()
             .filter(|key| !still_wrong.contains(*key))
+            .filter(|(subject, _)| !unjudgeable.contains(subject.as_str()))
             .cloned()
             .collect();
 
@@ -1510,6 +1523,98 @@ mod tests {
             "the all-clear must name the condition that ended, not the one still open"
         );
         assert_eq!(dispatcher.open_incidents(), 1);
+    }
+
+    /// A job that dies while one of its other rules is already failing must not
+    /// be told that rule recovered. It did not; it stopped being observable.
+    #[tokio::test]
+    async fn a_condition_suppressed_by_a_dead_loop_is_not_reported_as_recovered() {
+        let fake = Fake::shared();
+        let mut dispatcher = Dispatcher::new(fake.clone());
+
+        let bad_ratio = Assessment {
+            subject: "product-scraper".into(),
+            severity: Severity::Warn,
+            reason: Reason::RatioBelowMin {
+                rule: "parse rate".into(),
+                numerator: "parsed".into(),
+                denominator: "fetched".into(),
+                numerator_total: 10.0,
+                denominator_total: 1_200.0,
+                ratio: 0.008,
+                min: 0.9,
+                window: Duration::from_secs(3_600),
+                message: None,
+            },
+        };
+        let no_heartbeat = silent("product-scraper", Severity::Critical, 950);
+
+        dispatcher.dispatch(&[bad_ratio], at(2_000)).await;
+        assert_eq!(fake.levels(), [Level::Warn]);
+
+        // The loop stops. The evaluator now reports only the heartbeat.
+        for tick in 0..5 {
+            dispatcher
+                .dispatch(std::slice::from_ref(&no_heartbeat), at(2_100 + tick))
+                .await;
+        }
+
+        assert_eq!(
+            fake.levels(),
+            [Level::Warn, Level::Critical],
+            "no all-clear for a rule that merely stopped being observable"
+        );
+        assert_eq!(
+            dispatcher.open_incidents(),
+            2,
+            "the ratio incident stays open while the job is unjudgeable"
+        );
+    }
+
+    /// ...and once the job is judgeable again, a rule that really did clear
+    /// gets its all-clear as normal.
+    #[tokio::test]
+    async fn a_suppressed_condition_recovers_once_the_job_is_judgeable_again() {
+        let fake = Fake::shared();
+        let mut dispatcher = Dispatcher::new(fake.clone());
+
+        let bad_ratio = Assessment {
+            subject: "product-scraper".into(),
+            severity: Severity::Warn,
+            reason: Reason::RatioBelowMin {
+                rule: "parse rate".into(),
+                numerator: "parsed".into(),
+                denominator: "fetched".into(),
+                numerator_total: 10.0,
+                denominator_total: 1_200.0,
+                ratio: 0.008,
+                min: 0.9,
+                window: Duration::from_secs(3_600),
+                message: None,
+            },
+        };
+
+        dispatcher.dispatch(&[bad_ratio], at(2_000)).await;
+        dispatcher
+            .dispatch(
+                &[silent("product-scraper", Severity::Critical, 950)],
+                at(2_100),
+            )
+            .await;
+
+        // The job comes back and everything is fine.
+        dispatcher.dispatch(&[], at(2_200)).await;
+
+        assert_eq!(
+            fake.levels(),
+            [
+                Level::Warn,
+                Level::Critical,
+                Level::Recovered,
+                Level::Recovered
+            ]
+        );
+        assert_eq!(dispatcher.open_incidents(), 0);
     }
 
     // -- delivery failures -------------------------------------------------
