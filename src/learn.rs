@@ -240,11 +240,15 @@ pub struct AliveThresholds {
 /// *worst ordinary* gap, so a normal slow beat can never trip them.
 pub fn alive_thresholds(cadence: &Cadence) -> AliveThresholds {
     let expect_every = round_nearest(cadence.median);
-    let warn_after = round_up(cadence.worst * ALIVE_WARN_MULTIPLE)
-        // Guarantees the emitted config passes stillwatch's own validation,
-        // which refuses a warn threshold inside the expected beat interval.
-        .max(expect_every * 2);
-    let critical_after = round_up(warn_after * ALIVE_CRITICAL_MULTIPLE);
+
+    // The `max` calls are not belt and braces — they are what makes the emitted
+    // config valid by construction. stillwatch refuses a warn threshold inside
+    // the beat interval, and refuses a critical that is not beyond the warn; at
+    // a fast cadence, rounding alone can land on both. A learn mode that emits
+    // a config stillwatch itself will not load is worse than none.
+    let warn_after = round_up(cadence.worst * ALIVE_WARN_MULTIPLE).max(expect_every * 2);
+    let critical_after =
+        round_up(warn_after * ALIVE_CRITICAL_MULTIPLE).max(warn_after + Duration::from_secs(1));
 
     AliveThresholds {
         expect_every,
@@ -265,9 +269,15 @@ pub struct SilenceThresholds {
 /// because the useful thresholds for something that happens nightly are "one
 /// run late" and "two runs late", not "four times the usual wait".
 pub fn silence_thresholds(worst: Duration) -> SilenceThresholds {
+    let warn_after = round_up(worst.mul_f64(SILENCE_WARN_MARGIN)).max(Duration::from_secs(1));
+    // As above: the ordering is guaranteed here rather than left to rounding,
+    // because a config that does not load is not a suggestion, it is a bug.
+    let critical_after =
+        round_up(worst.mul_f64(SILENCE_CRITICAL_MARGIN)).max(warn_after + Duration::from_secs(1));
+
     SilenceThresholds {
-        warn_after: round_up(worst.mul_f64(SILENCE_WARN_MARGIN)),
-        critical_after: round_up(worst.mul_f64(SILENCE_CRITICAL_MARGIN)),
+        warn_after,
+        critical_after,
     }
 }
 
@@ -276,9 +286,8 @@ pub fn silence_thresholds(worst: Duration) -> SilenceThresholds {
 /// Always upward: the spec's rule is that no emitted threshold is ever tighter
 /// than the worst thing actually observed.
 pub fn round_up(d: Duration) -> Duration {
-    let step = step_for(d);
-    let secs = d.as_secs();
-    let step = step.max(1);
+    let step = step_for(d).max(1);
+    let secs = d.as_secs().max(1);
     Duration::from_secs(secs.div_ceil(step) * step)
 }
 
@@ -290,12 +299,18 @@ pub fn round_up(d: Duration) -> Duration {
 pub fn round_nearest(d: Duration) -> Duration {
     let step = step_for(d).max(1);
     let secs = d.as_secs();
-    Duration::from_secs(((secs + step / 2) / step) * step)
+    // Never round a real cadence away to nothing. A job beating every second
+    // has a cadence of one second, and `expect_every = "0s"` is a config
+    // stillwatch would refuse to load.
+    Duration::from_secs((((secs + step / 2) / step) * step).max(1))
 }
 
 fn step_for(d: Duration) -> u64 {
     match d.as_secs() {
-        0..=90 => 5,
+        // Fine-grained at the bottom: a job beating every second or two is a
+        // real thing, and a five-second step would round its cadence to zero.
+        0..=10 => 1,
+        11..=90 => 5,
         91..=600 => 30,
         601..=3_600 => 60,
         3_601..=86_400 => 900,

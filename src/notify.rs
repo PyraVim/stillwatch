@@ -832,6 +832,34 @@ impl Notifier for Telegram {
 // no notifier configured
 // ---------------------------------------------------------------------------
 
+/// Stands in for the real notifier under `--dry-run`.
+///
+/// Deliberately sits in the same place as a real notifier, *behind* the
+/// dispatcher, so what it prints has already been through deduplication,
+/// escalation and recovery. A dry run that logged every evaluation cycle would
+/// read as far noisier than the daemon actually is, and nobody would trust it
+/// enough to switch the real thing on — which is the entire purpose of having
+/// a dry run.
+#[derive(Debug, Default)]
+pub struct DryRun;
+
+#[async_trait]
+impl Notifier for DryRun {
+    async fn send(&self, notification: &Notification) -> Result<(), NotifyError> {
+        tracing::info!(
+            subject = %notification.subject,
+            level = ?notification.level,
+            "would have sent:\n{}",
+            notification.text
+        );
+        Ok(())
+    }
+
+    fn channel(&self) -> &'static str {
+        "dry-run"
+    }
+}
+
 /// Used when the config names no notifier.
 ///
 /// Writing alerts to the log is not a substitute for delivering them, and

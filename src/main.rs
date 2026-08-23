@@ -10,9 +10,9 @@ use std::time::{Duration, SystemTime};
 use clap::Parser;
 use stillwatch::config::{self, Config, ConfigError, SystemEnv};
 use stillwatch::evaluate::{check_health, evaluate, unjudged_signals, CheckHealth, UnjudgedSignal};
-use stillwatch::notify::{Dispatcher, LogOnly, Notifier, Telegram};
+use stillwatch::notify::{Dispatcher, DryRun, LogOnly, Notifier, Telegram};
 use stillwatch::state::{SharedState, State};
-use stillwatch::{fmt, prober, receiver};
+use stillwatch::{fmt, learn, prober, receiver};
 use tokio::time::MissedTickBehavior;
 use tracing_subscriber::EnvFilter;
 
@@ -32,6 +32,27 @@ struct Cli {
     /// Path to the config file. Defaults to $STILLWATCH_CONFIG, then ./stillwatch.toml
     #[arg(short, long, value_name = "PATH")]
     config: Option<PathBuf>,
+
+    /// Evaluate and log what would have been sent, without sending anything
+    #[arg(long)]
+    dry_run: bool,
+
+    #[command(subcommand)]
+    command: Option<Command>,
+}
+
+#[derive(clap::Subcommand)]
+enum Command {
+    /// Watch without alerting, then print thresholds derived from what happened
+    Learn {
+        /// Only learn this job or check. Defaults to everything in the config.
+        #[arg(long, value_name = "NAME")]
+        job: Option<String>,
+
+        /// How long to observe, e.g. 6h
+        #[arg(long = "for", value_name = "DURATION")]
+        window: String,
+    },
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -48,6 +69,12 @@ enum StartupError {
 
     #[error("could not build the http client used to probe dependencies")]
     Client(#[source] reqwest::Error),
+
+    #[error("--for is not a duration I can read; try something like 6h or 90m")]
+    Window {
+        #[source]
+        source: humantime::DurationError,
+    },
 
     #[error("the receiver stopped unexpectedly")]
     Serve(#[source] io::Error),
@@ -73,23 +100,32 @@ async fn run(cli: Cli) -> Result<(), StartupError> {
 
     tracing::info!(path = %path.display(), "loading config");
     let config = Config::load(&path, &env)?;
-    describe(&config);
 
-    let state = SharedState::new(State::new(SystemTime::now(), &config.jobs, &config.checks));
+    match cli.command {
+        Some(Command::Learn { job, window }) => {
+            let window = humantime::parse_duration(&window)
+                .map_err(|source| StartupError::Window { source })?;
+            learn_mode(config, job, window).await
+        }
+        None => watch_mode(config, cli.dry_run).await,
+    }
+}
 
-    let notifier: Arc<dyn Notifier> = match &config.telegram {
-        Some(telegram) => Arc::new(Telegram::new(telegram)),
-        None => Arc::new(LogOnly),
-    };
-    tracing::info!(channel = notifier.channel(), "notifier ready");
-
+/// Binds the receiver and starts one prober per check.
+///
+/// Shared by both modes on purpose: `learn` must observe through exactly the
+/// same path the daemon does, or the thresholds it derives will not match what
+/// the evaluator later judges against.
+async fn observe(
+    config: &Config,
+    state: &SharedState,
+) -> Result<(tokio::net::TcpListener, Vec<tokio::task::JoinHandle<()>>), StartupError> {
     let listener = tokio::net::TcpListener::bind(config.listen)
         .await
         .map_err(|source| StartupError::Listen {
             addr: config.listen,
             source,
         })?;
-
     tracing::info!(listen = %config.listen, "receiver ready");
 
     // One shared client so connection pooling is real: a fresh client per probe
@@ -99,14 +135,34 @@ async fn run(cli: Cli) -> Result<(), StartupError> {
         .build()
         .map_err(StartupError::Client)?;
 
-    let mut probers = Vec::with_capacity(config.checks.len());
-    for check in config.checks {
-        probers.push(tokio::spawn(prober::run(
-            check,
-            client.clone(),
-            state.clone(),
-        )));
-    }
+    let probers = config
+        .checks
+        .iter()
+        .map(|check| tokio::spawn(prober::run(check.clone(), client.clone(), state.clone())))
+        .collect();
+
+    Ok((listener, probers))
+}
+
+async fn watch_mode(config: Config, dry_run: bool) -> Result<(), StartupError> {
+    describe(&config);
+
+    let notifier: Arc<dyn Notifier> = if dry_run {
+        tracing::warn!(
+            "dry run: everything will be evaluated and logged, and nothing will be \
+             delivered anywhere"
+        );
+        Arc::new(DryRun)
+    } else {
+        match &config.telegram {
+            Some(telegram) => Arc::new(Telegram::new(telegram)),
+            None => Arc::new(LogOnly),
+        }
+    };
+    tracing::info!(channel = notifier.channel(), "notifier ready");
+
+    let state = SharedState::new(State::new(SystemTime::now(), &config.jobs, &config.checks));
+    let (listener, probers) = observe(&config, &state).await?;
 
     let evaluator = tokio::spawn(watch(state.clone(), Dispatcher::new(notifier)));
 
@@ -119,6 +175,63 @@ async fn run(cli: Cli) -> Result<(), StartupError> {
         prober.abort();
     }
     served.map_err(StartupError::Serve)
+}
+
+/// Watches without judging, then writes down what it saw.
+///
+/// No evaluator and no notifier are started at all — not a notifier that
+/// discards, none. `learn` is meant to be safe to point at production before
+/// anyone trusts the thresholds, and the way to be sure it sends nothing is for
+/// there to be nothing that could.
+async fn learn_mode(
+    config: Config,
+    only: Option<String>,
+    window: Duration,
+) -> Result<(), StartupError> {
+    let state = SharedState::new(State::new(SystemTime::now(), &config.jobs, &config.checks));
+    state.start_journal();
+
+    let (listener, probers) = observe(&config, &state).await?;
+
+    tracing::info!(
+        window = %fmt::duration(window),
+        job = only.as_deref().unwrap_or("<everything>"),
+        "learning: observing only, nothing will be evaluated or sent"
+    );
+
+    let served = axum::serve(listener, receiver::router(state.clone()))
+        .with_graceful_shutdown(observation_window(window))
+        .await;
+
+    for prober in probers {
+        prober.abort();
+    }
+    served.map_err(StartupError::Serve)?;
+
+    let now = SystemTime::now();
+    let report = state.read(|state| match state.journal() {
+        Some(journal) => learn::report(journal, &config, only.as_deref(), now),
+        None => String::new(),
+    });
+
+    // The config block goes to stdout so it can be redirected straight into a
+    // file; everything else has been going to the log all along.
+    println!("{report}");
+    Ok(())
+}
+
+/// Ends when the window elapses, or sooner on ctrl-c.
+async fn observation_window(window: Duration) {
+    tokio::select! {
+        _ = tokio::time::sleep(window) => {
+            tracing::info!("observation window complete");
+        }
+        _ = shutdown() => {
+            tracing::warn!(
+                "stopped early: the numbers below come from a shorter window than asked for"
+            );
+        }
+    }
 }
 
 /// Evaluates every job on a fixed tick and hands whatever is wrong to the
