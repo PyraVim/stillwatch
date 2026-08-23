@@ -749,6 +749,261 @@ mod tests {
         }
     }
 
+    // -- check alerts ------------------------------------------------------
+
+    fn degraded(
+        severity: Severity,
+        recent_ms: u64,
+        baseline: Baseline,
+        trigger: Trigger,
+    ) -> Assessment {
+        Assessment {
+            subject: "vendor-api".into(),
+            severity,
+            reason: Reason::Degraded {
+                recent_p90: Duration::from_millis(recent_ms),
+                recent_window: Duration::from_secs(600),
+                recent_samples: 20,
+                baseline,
+                baseline_window: Duration::from_secs(3_600),
+                absolute_ceiling: Duration::from_secs(2),
+                trigger,
+            },
+        }
+    }
+
+    #[test]
+    fn a_degradation_reads_as_current_baseline_and_implication() {
+        let now = at(1_755_000_000);
+        let notification = render(
+            &degraded(
+                Severity::Critical,
+                1_400,
+                Baseline::Ready {
+                    p90: Duration::from_millis(140),
+                    samples: 118,
+                },
+                Trigger::Baseline { ratio: 10.0 },
+            ),
+            now,
+        );
+
+        let lines: Vec<_> = notification.text.lines().collect();
+        assert_eq!(lines.len(), 4);
+        assert!(
+            lines[0].starts_with("🔴  vendor-api — degraded"),
+            "{}",
+            lines[0]
+        );
+        assert!(lines[1].contains("p90 1.4s"), "{}", lines[1]);
+        assert!(lines[1].contains("baseline 140ms"), "{}", lines[1]);
+        assert!(
+            lines[2].contains("still responding"),
+            "an alert should rule something out: {}",
+            lines[2]
+        );
+        assert!(lines[3].contains("10.0x its own normal"), "{}", lines[3]);
+    }
+
+    /// The alert must never quote a comforting ratio off a baseline that has
+    /// learned an unacceptable normal.
+    #[test]
+    fn a_degradation_on_a_poisoned_baseline_says_the_baseline_is_worthless() {
+        let now = at(1_755_000_000);
+        let notification = render(
+            &degraded(
+                Severity::Warn,
+                3_000,
+                Baseline::NotCredible {
+                    p90: Duration::from_millis(3_000),
+                    samples: 118,
+                },
+                Trigger::Ceiling,
+            ),
+            now,
+        );
+
+        assert!(
+            notification.text.contains("learned that slow is normal"),
+            "{}",
+            notification.text
+        );
+        assert!(
+            notification.text.contains("multiples cannot fire"),
+            "{}",
+            notification.text
+        );
+    }
+
+    /// During warmup the alert has to admit it has no baseline rather than
+    /// implying the ceiling breach was measured against one.
+    #[test]
+    fn a_degradation_during_warmup_says_there_is_no_baseline_yet() {
+        let now = at(1_755_000_000);
+        let notification = render(
+            &degraded(
+                Severity::Warn,
+                3_000,
+                Baseline::Warming {
+                    samples: 4,
+                    needed: 30,
+                },
+                Trigger::Ceiling,
+            ),
+            now,
+        );
+
+        assert!(
+            notification
+                .text
+                .contains("no baseline yet (4 of 30 probes)"),
+            "{}",
+            notification.text
+        );
+        assert!(
+            notification.text.contains("ceiling alone"),
+            "{}",
+            notification.text
+        );
+    }
+
+    #[test]
+    fn an_untrustworthy_baseline_alert_says_what_to_do_about_it() {
+        let now = at(1_755_000_000);
+        let notification = render(
+            &Assessment {
+                subject: "vendor-api".into(),
+                severity: Severity::Warn,
+                reason: Reason::BaselineNotCredible {
+                    baseline_p90: Duration::from_millis(2_500),
+                    baseline_samples: 118,
+                    baseline_window: Duration::from_secs(3_600),
+                    absolute_ceiling: Duration::from_secs(2),
+                },
+            },
+            now,
+        );
+
+        assert!(
+            notification.text.contains("cannot be trusted"),
+            "{}",
+            notification.text
+        );
+        assert!(
+            notification.text.contains("nothing is failing"),
+            "it must rule out an actual outage: {}",
+            notification.text
+        );
+        assert!(
+            notification.text.contains("would not trip the multiples"),
+            "{}",
+            notification.text
+        );
+    }
+
+    #[test]
+    fn a_down_check_names_the_error_it_last_saw() {
+        let now = at(1_755_000_000);
+        let notification = render(
+            &Assessment {
+                subject: "queue-broker".into(),
+                severity: Severity::Critical,
+                reason: Reason::CheckDown {
+                    failing_for: Duration::from_secs(124),
+                    failed_probes: 4,
+                    last_error: "connection refused".into(),
+                },
+            },
+            now,
+        );
+
+        assert!(
+            notification
+                .text
+                .starts_with("🔴  queue-broker — down for 2m4s"),
+            "{}",
+            notification.text
+        );
+        assert!(
+            notification.text.contains("connection refused"),
+            "{}",
+            notification.text
+        );
+        assert!(
+            notification.text.contains("not getting slow answers"),
+            "{}",
+            notification.text
+        );
+    }
+
+    /// Every alert this tool can produce ends with a plain-language implication.
+    #[test]
+    fn every_check_alert_ends_with_an_implication() {
+        let now = at(1_755_000_000);
+        let assessments = [
+            degraded(
+                Severity::Warn,
+                1_400,
+                Baseline::Ready {
+                    p90: Duration::from_millis(140),
+                    samples: 118,
+                },
+                Trigger::Both { ratio: 10.0 },
+            ),
+            Assessment {
+                subject: "vendor-api".into(),
+                severity: Severity::Warn,
+                reason: Reason::BaselineNotCredible {
+                    baseline_p90: Duration::from_millis(2_500),
+                    baseline_samples: 118,
+                    baseline_window: Duration::from_secs(3_600),
+                    absolute_ceiling: Duration::from_secs(2),
+                },
+            },
+            Assessment {
+                subject: "queue-broker".into(),
+                severity: Severity::Critical,
+                reason: Reason::CheckDown {
+                    failing_for: Duration::from_secs(124),
+                    failed_probes: 4,
+                    last_error: "connection refused".into(),
+                },
+            },
+        ];
+
+        for assessment in assessments {
+            let text = render(&assessment, now).text;
+            let last = text.lines().last().unwrap_or_default();
+            assert!(last.trim_start().starts_with('→'), "{text}");
+        }
+    }
+
+    /// The all-clear reuses the headline that opened the incident, so a
+    /// degradation resolves as "degraded for ..." and not as something else.
+    #[test]
+    fn check_recoveries_reuse_the_reason_headline() {
+        let degraded = degraded(
+            Severity::Warn,
+            1_400,
+            Baseline::Ready {
+                p90: Duration::from_millis(140),
+                samples: 118,
+            },
+            Trigger::Ceiling,
+        );
+
+        let notification = render_recovery(
+            "vendor-api",
+            degraded.reason.headline(),
+            Duration::from_secs(1_084),
+        );
+
+        assert_eq!(
+            notification.text,
+            "✅  vendor-api recovered — degraded for 18m4s"
+        );
+    }
+
     // -- dispatch ----------------------------------------------------------
 
     /// A notifier that records what it was given and can be told to reject

@@ -110,6 +110,28 @@ mod tests {
     }
 
     #[test]
+    fn latency_keeps_the_precision_people_compare_at() {
+        assert_eq!(latency(Duration::from_millis(90)), "90ms");
+        assert_eq!(latency(Duration::from_millis(140)), "140ms");
+        assert_eq!(latency(Duration::from_millis(1_400)), "1.4s");
+        assert_eq!(latency(Duration::from_millis(2_000)), "2s");
+    }
+
+    /// `duration` counts whole seconds, so every healthy response time would
+    /// render as `0s` — the one number a degradation alert must never print.
+    #[test]
+    fn latency_never_renders_a_real_response_as_zero() {
+        assert_eq!(duration(Duration::from_millis(90)), "0s");
+        assert_eq!(latency(Duration::from_millis(90)), "90ms");
+        assert_eq!(latency(Duration::from_micros(400)), "<1ms");
+    }
+
+    #[test]
+    fn latency_falls_back_to_duration_past_a_minute() {
+        assert_eq!(latency(Duration::from_secs(90)), "1m30s");
+    }
+
+    #[test]
     fn timestamp_includes_date_only_when_not_today() {
         let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_755_000_000);
         let earlier_same_day = now - Duration::from_secs(60);
