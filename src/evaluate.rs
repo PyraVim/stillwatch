@@ -126,16 +126,39 @@ pub enum Trigger {
 
 impl Eq for Trigger {}
 
+/// What an incident is *about*, independent of its severity or detail.
+///
+/// This is half the deduplication key, alongside the subject. One subject can
+/// have several things wrong with it at once — a job can be missing its
+/// heartbeat while a counter ratio has also collapsed — and keying on the
+/// subject alone would let the first of those silently suppress the rest.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Condition {
+    NoHeartbeat,
+    Down,
+    Degraded,
+    UntrustworthyBaseline,
+}
+
 impl Reason {
     /// A few words naming the condition, reused verbatim in the all-clear so
     /// that "recovered — no heartbeat for 18m4s" lines up with the alert that
     /// opened the incident.
-    pub fn headline(&self) -> &'static str {
+    pub fn headline(&self) -> String {
         match self {
-            Reason::NoHeartbeat { .. } => "no heartbeat",
-            Reason::CheckDown { .. } => "down",
-            Reason::Degraded { .. } => "degraded",
-            Reason::BaselineNotCredible { .. } => "an untrustworthy baseline",
+            Reason::NoHeartbeat { .. } => "no heartbeat".to_string(),
+            Reason::CheckDown { .. } => "down".to_string(),
+            Reason::Degraded { .. } => "degraded".to_string(),
+            Reason::BaselineNotCredible { .. } => "an untrustworthy baseline".to_string(),
+        }
+    }
+
+    pub fn condition(&self) -> Condition {
+        match self {
+            Reason::NoHeartbeat { .. } => Condition::NoHeartbeat,
+            Reason::CheckDown { .. } => Condition::Down,
+            Reason::Degraded { .. } => Condition::Degraded,
+            Reason::BaselineNotCredible { .. } => Condition::UntrustworthyBaseline,
         }
     }
 }

@@ -19,7 +19,7 @@ use std::time::{Duration, SystemTime};
 use async_trait::async_trait;
 
 use crate::config::TelegramConfig;
-use crate::evaluate::{Assessment, Baseline, LastSeen, Reason, Severity, Trigger};
+use crate::evaluate::{Assessment, Baseline, Condition, LastSeen, Reason, Severity, Trigger};
 use crate::fmt;
 
 /// What a notification is about, from the reader's point of view.
@@ -334,6 +334,13 @@ const MAX_RETRY: Duration = Duration::from_secs(300);
 /// unbounded memory.
 const MAX_OUTBOX: usize = 512;
 
+/// What one open incident is keyed by: the subject, and what is wrong with it.
+///
+/// Both halves are needed. A job can be missing its heartbeat *and* have a
+/// collapsed parse rate at the same time, and those are two things a person
+/// needs told, not one.
+type IncidentKey = (String, Condition);
+
 /// An incident that has been reported and has not yet cleared.
 #[derive(Debug)]
 struct Open {
@@ -345,7 +352,7 @@ struct Open {
     /// the all-clear reports the whole outage.
     opened_at: SystemTime,
 
-    headline: &'static str,
+    headline: String,
 }
 
 /// Turns a stream of per-cycle assessments into the alerts a person actually
@@ -361,7 +368,7 @@ struct Open {
 ///   with backoff
 pub struct Dispatcher {
     notifier: Arc<dyn Notifier>,
-    open: BTreeMap<String, Open>,
+    open: BTreeMap<IncidentKey, Open>,
 
     /// Rendered but undelivered, oldest first. Order is preserved so that a
     /// recovery can never overtake the alert it resolves.
@@ -407,23 +414,29 @@ impl Dispatcher {
     fn reconcile(&mut self, assessments: &[Assessment], now: SystemTime) {
         let mut queued = Vec::new();
 
-        let still_wrong: BTreeSet<&str> = assessments.iter().map(|a| a.subject.as_str()).collect();
-        let recovered: Vec<String> = self
+        let still_wrong: BTreeSet<IncidentKey> = assessments
+            .iter()
+            .map(|a| (a.subject.clone(), a.reason.condition()))
+            .collect();
+
+        let recovered: Vec<IncidentKey> = self
             .open
             .keys()
-            .filter(|subject| !still_wrong.contains(subject.as_str()))
+            .filter(|key| !still_wrong.contains(*key))
             .cloned()
             .collect();
 
-        for subject in recovered {
-            if let Some(open) = self.open.remove(&subject) {
+        for key in recovered {
+            if let Some(open) = self.open.remove(&key) {
                 let lasted = now.duration_since(open.opened_at).unwrap_or(Duration::ZERO);
-                queued.push(render_recovery(&subject, open.headline, lasted));
+                queued.push(render_recovery(&key.0, &open.headline, lasted));
             }
         }
 
         for assessment in assessments {
-            match self.open.get_mut(&assessment.subject) {
+            let key = (assessment.subject.clone(), assessment.reason.condition());
+
+            match self.open.get_mut(&key) {
                 // Already reported at this severity or worse. Saying it again
                 // every cycle is how alerting gets muted.
                 Some(open) if assessment.severity <= open.severity => {}
@@ -437,7 +450,7 @@ impl Dispatcher {
 
                 None => {
                     self.open.insert(
-                        assessment.subject.clone(),
+                        key,
                         Open {
                             severity: assessment.severity,
                             opened_at: now,
@@ -994,7 +1007,7 @@ mod tests {
 
         let notification = render_recovery(
             "vendor-api",
-            degraded.reason.headline(),
+            &degraded.reason.headline(),
             Duration::from_secs(1_084),
         );
 
@@ -1224,6 +1237,74 @@ mod tests {
                 ("nightly-sync".to_string(), Level::Recovered),
             ]
         );
+    }
+
+    /// Deduplication is per condition, not per subject. One subject can have
+    /// several things wrong with it at once, and the first must not silence the
+    /// rest.
+    #[tokio::test]
+    async fn two_different_conditions_on_one_subject_both_alert() {
+        let fake = Fake::shared();
+        let mut dispatcher = Dispatcher::new(fake.clone());
+
+        let both = [
+            silent("vendor-api", Severity::Warn, 312),
+            degraded(
+                Severity::Critical,
+                1_400,
+                Baseline::Ready {
+                    p90: Duration::from_millis(140),
+                    samples: 118,
+                },
+                Trigger::Baseline { ratio: 10.0 },
+            ),
+        ];
+
+        for tick in 0..10 {
+            dispatcher.dispatch(&both, at(2_000 + tick)).await;
+        }
+
+        assert_eq!(
+            fake.levels(),
+            [Level::Warn, Level::Critical],
+            "both conditions should be reported, each exactly once"
+        );
+        assert_eq!(dispatcher.open_incidents(), 2);
+    }
+
+    /// ...and each recovers on its own, without disturbing the other.
+    #[tokio::test]
+    async fn one_condition_recovering_leaves_the_other_open() {
+        let fake = Fake::shared();
+        let mut dispatcher = Dispatcher::new(fake.clone());
+
+        let heartbeat = silent("vendor-api", Severity::Warn, 312);
+        let slow = degraded(
+            Severity::Critical,
+            1_400,
+            Baseline::Ready {
+                p90: Duration::from_millis(140),
+                samples: 118,
+            },
+            Trigger::Baseline { ratio: 10.0 },
+        );
+
+        dispatcher
+            .dispatch(&[heartbeat.clone(), slow.clone()], at(2_000))
+            .await;
+        // The heartbeat comes back; the latency does not.
+        dispatcher.dispatch(&[slow], at(2_100)).await;
+
+        assert_eq!(
+            fake.levels(),
+            [Level::Warn, Level::Critical, Level::Recovered]
+        );
+        assert_eq!(
+            fake.delivered()[2].text,
+            "✅  vendor-api recovered — no heartbeat for 1m40s",
+            "the all-clear must name the condition that ended, not the one still open"
+        );
+        assert_eq!(dispatcher.open_incidents(), 1);
     }
 
     // -- delivery failures -------------------------------------------------
