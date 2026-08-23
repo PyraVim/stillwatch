@@ -7,7 +7,13 @@
 
 use std::time::{Duration, SystemTime};
 
-use crate::state::{JobState, State};
+use crate::config::DegradationConfig;
+use crate::state::{percentile, CheckState, JobState, Observation, Outcome, State};
+
+/// The percentile latency is judged at, for both the baseline and the current
+/// window. A p90 ignores the one-in-ten slow request that every dependency has
+/// while still moving as soon as most requests get slower.
+const JUDGED_PERCENTILE: f64 = 0.9;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Severity {
@@ -32,7 +38,93 @@ pub enum Reason {
         since: LastSeen,
         expect_every: Duration,
     },
+
+    /// Every probe for at least `down_after` has failed.
+    CheckDown {
+        failing_for: Duration,
+        failed_probes: usize,
+        last_error: String,
+    },
+
+    /// Latency has crossed the ceiling, its own baseline, or both.
+    Degraded {
+        recent_p90: Duration,
+        recent_window: Duration,
+        recent_samples: usize,
+        baseline: Baseline,
+        baseline_window: Duration,
+        absolute_ceiling: Duration,
+        trigger: Trigger,
+    },
+
+    /// Nothing is slow right now, but the baseline this check is judged against
+    /// has itself learned a normal at or above the ceiling — so the multiples
+    /// can never fire and the check is not protecting anything.
+    BaselineNotCredible {
+        baseline_p90: Duration,
+        baseline_samples: usize,
+        baseline_window: Duration,
+        absolute_ceiling: Duration,
+    },
 }
+
+/// What the current latency is being compared against.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Baseline {
+    /// Not enough observations yet. The check is being judged against the
+    /// ceiling alone, and the alert says so — "no baseline" must never be
+    /// quietly reported as "healthy".
+    Warming {
+        samples: usize,
+        needed: usize,
+    },
+
+    Ready {
+        p90: Duration,
+        samples: usize,
+    },
+
+    /// Enough observations, but they taught a normal at or above the ceiling.
+    ///
+    /// This is what a poisoned baseline looks like from the inside: stillwatch
+    /// started while the dependency was already slow, learned that slow is
+    /// normal, and the multiples will now never fire. Carried into the alert so
+    /// a reader is told the comparison is worthless rather than being handed a
+    /// reassuring ratio.
+    NotCredible {
+        p90: Duration,
+        samples: usize,
+    },
+}
+
+impl Baseline {
+    /// The p90, if there is one worth comparing against.
+    pub fn p90(&self) -> Option<Duration> {
+        match self {
+            Baseline::Ready { p90, .. } | Baseline::NotCredible { p90, .. } => Some(*p90),
+            Baseline::Warming { .. } => None,
+        }
+    }
+}
+
+/// Which rule fired.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Trigger {
+    /// Past `absolute_ceiling`. Evaluated with or without a baseline, and it is
+    /// the only thing that fires when the baseline has been poisoned.
+    Ceiling,
+
+    /// A multiple of the check's own recent normal.
+    Baseline {
+        ratio: f64,
+    },
+
+    Both {
+        ratio: f64,
+    },
+}
+
+impl Eq for Trigger {}
 
 impl Reason {
     /// A few words naming the condition, reused verbatim in the all-clear so
@@ -41,8 +133,42 @@ impl Reason {
     pub fn headline(&self) -> &'static str {
         match self {
             Reason::NoHeartbeat { .. } => "no heartbeat",
+            Reason::CheckDown { .. } => "down",
+            Reason::Degraded { .. } => "degraded",
+            Reason::BaselineNotCredible { .. } => "an untrustworthy baseline",
         }
     }
+}
+
+/// What a reader needs to know about whether a check is actually being judged.
+///
+/// The spec called for three states. There are four, because conflating "not
+/// judged yet" with "healthy" is the same mistake as treating a job with no
+/// heartbeat history as fine: in both cases the tool would be silent for a
+/// reason that has nothing to do with the dependency being well.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CheckHealth {
+    /// Responding, but the baseline is not yet usable — only the ceiling is
+    /// being applied.
+    Warming {
+        samples: usize,
+        needed: usize,
+    },
+
+    Ok,
+
+    /// Responding well, but the baseline is far worse than current reality,
+    /// which means it was learned during a slow stretch and will not fire when
+    /// it should. Logged rather than alerted: this is the expected state for a
+    /// window's length after every genuine incident recovers, and paging on it
+    /// would add a message to every incident.
+    OkWithStaleBaseline {
+        baseline_p90: Duration,
+        recent_p90: Duration,
+    },
+
+    Degraded,
+    Down,
 }
 
 /// What the silence is being measured from.
@@ -68,9 +194,26 @@ pub enum LastSeen {
 /// Jobs come out in a fixed order, so two evaluations of the same state produce
 /// byte-identical output.
 pub fn evaluate(state: &State, now: SystemTime) -> Vec<Assessment> {
-    state
+    let jobs = state
         .jobs()
-        .filter_map(|job| assess_alive(job, state.started_at(), now))
+        .filter_map(|job| assess_alive(job, state.started_at(), now));
+
+    let checks = state
+        .checks()
+        .filter_map(|check| assess_check(check, now).1);
+
+    jobs.chain(checks).collect()
+}
+
+/// Reports what each check's latency verdict is currently based on.
+///
+/// Separate from `evaluate` because most of these are not alerts: a check that
+/// is warming up or judging against a stale baseline is not an incident, but a
+/// reader still needs to be able to tell whether it is being judged at all.
+pub fn check_health(state: &State, now: SystemTime) -> Vec<(String, CheckHealth)> {
+    state
+        .checks()
+        .map(|check| (check.name().to_string(), assess_check(check, now).0))
         .collect()
 }
 
@@ -107,6 +250,227 @@ fn assess_alive(job: &JobState, watch_started: SystemTime, now: SystemTime) -> O
             expect_every: alive.expect_every,
         },
     })
+}
+
+fn assess_check(check: &CheckState, now: SystemTime) -> (CheckHealth, Option<Assessment>) {
+    let config = &check.config;
+    let subject = check.name().to_string();
+
+    // -- down --------------------------------------------------------------
+    //
+    // Every probe within `down_after` has to have failed. One blip inside an
+    // otherwise healthy stretch is not an outage, and requiring at least one
+    // observation means a check that has not run yet is never called down.
+    let recent: Vec<&Observation> = check.window(config.down_after, now).collect();
+    let all_failed = !recent.is_empty()
+        && recent
+            .iter()
+            .all(|observation| matches!(observation.outcome, Outcome::Failed(_)));
+
+    if all_failed {
+        let run = failing_run(check);
+        let failing_for = run
+            .start
+            .and_then(|start| now.duration_since(start).ok())
+            .unwrap_or_default();
+
+        return (
+            CheckHealth::Down,
+            Some(Assessment {
+                subject,
+                severity: Severity::Critical,
+                reason: Reason::CheckDown {
+                    failing_for,
+                    failed_probes: run.count,
+                    last_error: run.last_error,
+                },
+            }),
+        );
+    }
+
+    // A check with no `[check.degradation]` block asked to be watched for
+    // up/down only, and is never judged on latency.
+    let Some(degradation) = config.degradation else {
+        return (CheckHealth::Ok, None);
+    };
+
+    // -- current latency ---------------------------------------------------
+    let recent: Vec<&Observation> = check.window(degradation.recent_window, now).collect();
+    let recent_samples = recent
+        .iter()
+        .filter(|observation| matches!(observation.outcome, Outcome::Responded(_)))
+        .count();
+
+    let baseline = build_baseline(check, &degradation, now);
+
+    let Some(recent_p90) = percentile(recent.iter().copied(), JUDGED_PERCENTILE) else {
+        // Nothing has answered recently, but not for long enough to be down.
+        // There is nothing to judge and nothing to claim.
+        return (health_without_verdict(baseline), None);
+    };
+
+    // -- the ceiling, which does not depend on the baseline -----------------
+    //
+    // This is the whole defence against a poisoned baseline. It is evaluated
+    // before any baseline exists and regardless of what one has learned.
+    let over_ceiling = recent_p90 >= degradation.absolute_ceiling;
+
+    // -- the multiples, which do --------------------------------------------
+    let ratio = baseline.p90().and_then(|baseline_p90| {
+        // A baseline of zero cannot be multiplied into anything meaningful, so
+        // such a check rests on the ceiling alone.
+        (!baseline_p90.is_zero()).then(|| recent_p90.as_secs_f64() / baseline_p90.as_secs_f64())
+    });
+
+    let from_baseline = ratio.and_then(|ratio| {
+        if ratio >= degradation.critical_multiple {
+            Some(Severity::Critical)
+        } else if ratio >= degradation.warn_multiple {
+            Some(Severity::Warn)
+        } else {
+            None
+        }
+    });
+
+    // Crossing the ceiling is always worth at least a warning; the multiples
+    // can raise it but never lower it.
+    let severity = match (over_ceiling, from_baseline) {
+        (true, Some(from_baseline)) => Some(from_baseline.max(Severity::Warn)),
+        (true, None) => Some(Severity::Warn),
+        (false, from_baseline) => from_baseline,
+    };
+
+    if let Some(severity) = severity {
+        let trigger = match (over_ceiling, ratio, from_baseline.is_some()) {
+            (true, Some(ratio), true) => Trigger::Both { ratio },
+            (true, _, _) => Trigger::Ceiling,
+            (false, Some(ratio), _) => Trigger::Baseline { ratio },
+            // Unreachable: severity is only Some when one of the two fired.
+            (false, None, _) => Trigger::Ceiling,
+        };
+
+        return (
+            CheckHealth::Degraded,
+            Some(Assessment {
+                subject,
+                severity,
+                reason: Reason::Degraded {
+                    recent_p90,
+                    recent_window: degradation.recent_window,
+                    recent_samples,
+                    baseline,
+                    baseline_window: degradation.baseline_window,
+                    absolute_ceiling: degradation.absolute_ceiling,
+                    trigger,
+                },
+            }),
+        );
+    }
+
+    // -- nothing is wrong right now, but is the baseline worth anything? ----
+    if let Baseline::NotCredible { p90, samples } = baseline {
+        return (
+            CheckHealth::Degraded,
+            Some(Assessment {
+                subject,
+                severity: Severity::Warn,
+                reason: Reason::BaselineNotCredible {
+                    baseline_p90: p90,
+                    baseline_samples: samples,
+                    baseline_window: degradation.baseline_window,
+                    absolute_ceiling: degradation.absolute_ceiling,
+                },
+            }),
+        );
+    }
+
+    // A baseline far worse than current reality was learned during a slow
+    // stretch. Worth saying, not worth paging: this is the ordinary state for a
+    // window's length after any real incident clears.
+    if let Baseline::Ready { p90, .. } = baseline {
+        let stale = !p90.is_zero()
+            && recent_p90.as_secs_f64() * degradation.warn_multiple <= p90.as_secs_f64();
+        if stale {
+            return (
+                CheckHealth::OkWithStaleBaseline {
+                    baseline_p90: p90,
+                    recent_p90,
+                },
+                None,
+            );
+        }
+    }
+
+    (health_without_verdict(baseline), None)
+}
+
+fn health_without_verdict(baseline: Baseline) -> CheckHealth {
+    match baseline {
+        Baseline::Warming { samples, needed } => CheckHealth::Warming { samples, needed },
+        _ => CheckHealth::Ok,
+    }
+}
+
+/// Builds the baseline from the window *before* the recent one.
+fn build_baseline(
+    check: &CheckState,
+    degradation: &DegradationConfig,
+    now: SystemTime,
+) -> Baseline {
+    let observations: Vec<&Observation> = check
+        .window_between(degradation.baseline_window, degradation.recent_window, now)
+        .collect();
+
+    let samples = observations
+        .iter()
+        .filter(|observation| matches!(observation.outcome, Outcome::Responded(_)))
+        .count();
+
+    if samples < degradation.min_samples {
+        return Baseline::Warming {
+            samples,
+            needed: degradation.min_samples,
+        };
+    }
+
+    match percentile(observations.iter().copied(), JUDGED_PERCENTILE) {
+        Some(p90) if p90 >= degradation.absolute_ceiling => Baseline::NotCredible { p90, samples },
+        Some(p90) => Baseline::Ready { p90, samples },
+        None => Baseline::Warming {
+            samples,
+            needed: degradation.min_samples,
+        },
+    }
+}
+
+struct FailingRun {
+    start: Option<SystemTime>,
+    count: usize,
+    last_error: String,
+}
+
+/// Walks back from the newest observation for as long as probes were failing.
+fn failing_run(check: &CheckState) -> FailingRun {
+    let mut run = FailingRun {
+        start: None,
+        count: 0,
+        last_error: "no detail recorded".to_string(),
+    };
+
+    for observation in check.newest_first() {
+        match &observation.outcome {
+            Outcome::Failed(error) => {
+                if run.count == 0 {
+                    run.last_error = error.clone();
+                }
+                run.count += 1;
+                run.start = Some(observation.at);
+            }
+            Outcome::Responded(_) => break,
+        }
+    }
+
+    run
 }
 
 #[cfg(test)]
@@ -178,7 +542,13 @@ mod tests {
         let assessments = evaluate(&state, at(STARTED + 312));
         let Reason::NoHeartbeat {
             silent_for, since, ..
-        } = &assessments[0].reason;
+        } = &assessments[0].reason
+        else {
+            panic!(
+                "expected a heartbeat reason, got {:?}",
+                assessments[0].reason
+            )
+        };
 
         assert_eq!(*since, LastSeen::WatchdogStart(at(STARTED)));
         assert_eq!(*silent_for, Duration::from_secs(312));
@@ -292,7 +662,13 @@ mod tests {
         let assessments = evaluate(&state, at(5_312));
         let Reason::NoHeartbeat {
             silent_for, since, ..
-        } = &assessments[0].reason;
+        } = &assessments[0].reason
+        else {
+            panic!(
+                "expected a heartbeat reason, got {:?}",
+                assessments[0].reason
+            )
+        };
 
         assert_eq!(*since, LastSeen::Beat(at(5_000)));
         assert_eq!(*silent_for, Duration::from_secs(312));
@@ -333,6 +709,496 @@ mod tests {
             severities(&assessments),
             [("product-scraper", Severity::Critical)]
         );
+    }
+
+    // -- checks: fixtures --------------------------------------------------
+
+    use crate::config::{CheckConfig, DegradationConfig, ProbeConfig};
+    use crate::state::{Observation, Outcome};
+
+    const INTERVAL: u64 = 30;
+    const CEILING_MS: u64 = 2_000;
+
+    /// `interval` 30s, `recent_window` 10m (20 probes), `baseline_window` 1h,
+    /// warn at 3x, critical at 8x, ceiling 2s, 30 samples needed.
+    fn vendor_api() -> CheckConfig {
+        CheckConfig {
+            name: "vendor-api".into(),
+            probe: ProbeConfig::Http {
+                url: "https://api.vendor.com/health".parse().expect("valid url"),
+            },
+            interval: Duration::from_secs(INTERVAL),
+            timeout: Duration::from_secs(3),
+            down_after: Duration::from_secs(60),
+            degradation: Some(DegradationConfig {
+                baseline_window: Duration::from_secs(3_600),
+                recent_window: Duration::from_secs(600),
+                warn_multiple: 3.0,
+                critical_multiple: 8.0,
+                absolute_ceiling: Duration::from_millis(CEILING_MS),
+                min_samples: 30,
+            }),
+        }
+    }
+
+    /// A check with no `[check.degradation]` block: up/down only.
+    fn ping_only() -> CheckConfig {
+        CheckConfig {
+            name: "queue-broker".into(),
+            degradation: None,
+            ..vendor_api()
+        }
+    }
+
+    fn with_checks(checks: &[CheckConfig]) -> State {
+        State::new(at(STARTED), &[], checks)
+    }
+
+    /// Probes `check` every interval from `from` to `to`, each taking `millis`.
+    fn probe_steadily(state: &mut State, check: &str, from: u64, to: u64, millis: u64) {
+        let mut t = from;
+        while t <= to {
+            state.record_probe(
+                check,
+                Observation {
+                    at: at(t),
+                    outcome: Outcome::Responded(Duration::from_millis(millis)),
+                },
+            );
+            t += INTERVAL;
+        }
+    }
+
+    fn probe_failing(state: &mut State, check: &str, from: u64, to: u64, error: &str) {
+        let mut t = from;
+        while t <= to {
+            state.record_probe(
+                check,
+                Observation {
+                    at: at(t),
+                    outcome: Outcome::Failed(error.to_string()),
+                },
+            );
+            t += INTERVAL;
+        }
+    }
+
+    fn health_of(state: &State, check: &str, now: SystemTime) -> CheckHealth {
+        check_health(state, now)
+            .into_iter()
+            .find(|(name, _)| name == check)
+            .map(|(_, health)| health)
+            .expect("check should be present")
+    }
+
+    // -- cold start --------------------------------------------------------
+
+    /// A check with no baseline yet must not produce a degradation verdict, and
+    /// must not be reported as healthy either. "Not judged yet" is its own fact.
+    #[test]
+    fn a_check_with_no_baseline_yet_is_warming_not_ok() {
+        let mut state = with_checks(&[vendor_api()]);
+        probe_steadily(&mut state, "vendor-api", STARTED, STARTED + 300, 90);
+
+        let now = at(STARTED + 300);
+        assert!(evaluate(&state, now).is_empty(), "nothing to alert on yet");
+        assert!(
+            matches!(
+                health_of(&state, "vendor-api", now),
+                CheckHealth::Warming { needed: 30, .. }
+            ),
+            "got {:?}",
+            health_of(&state, "vendor-api", now)
+        );
+    }
+
+    #[test]
+    fn a_check_that_has_never_been_probed_is_warming_with_no_samples() {
+        let state = with_checks(&[vendor_api()]);
+        let now = at(STARTED + 10);
+
+        assert!(evaluate(&state, now).is_empty());
+        assert_eq!(
+            health_of(&state, "vendor-api", now),
+            CheckHealth::Warming {
+                samples: 0,
+                needed: 30
+            }
+        );
+    }
+
+    #[test]
+    fn a_check_becomes_ok_once_the_baseline_is_populated() {
+        let mut state = with_checks(&[vendor_api()]);
+        // An hour and a half of healthy probes.
+        probe_steadily(&mut state, "vendor-api", STARTED, STARTED + 5_400, 90);
+
+        let now = at(STARTED + 5_400);
+        assert!(evaluate(&state, now).is_empty());
+        assert_eq!(health_of(&state, "vendor-api", now), CheckHealth::Ok);
+    }
+
+    /// The ceiling does not wait for a baseline. A dependency that is already
+    /// unacceptably slow on the very first probes is reported immediately.
+    #[test]
+    fn the_ceiling_fires_during_warmup_before_any_baseline_exists() {
+        let mut state = with_checks(&[vendor_api()]);
+        probe_steadily(&mut state, "vendor-api", STARTED, STARTED + 300, 3_000);
+
+        let now = at(STARTED + 300);
+        let assessments = evaluate(&state, now);
+
+        assert_eq!(assessments.len(), 1);
+        assert_eq!(assessments[0].subject, "vendor-api");
+        assert_eq!(assessments[0].severity, Severity::Warn);
+
+        let Reason::Degraded {
+            trigger, baseline, ..
+        } = &assessments[0].reason
+        else {
+            panic!("expected a degradation, got {:?}", assessments[0].reason)
+        };
+        assert_eq!(*trigger, Trigger::Ceiling);
+        assert!(
+            matches!(baseline, Baseline::Warming { .. }),
+            "the alert must admit it has no baseline: {baseline:?}"
+        );
+    }
+
+    // -- baseline poisoning ------------------------------------------------
+
+    /// The failure mode that matters: stillwatch starts while the dependency is
+    /// already degraded. The baseline learns that 3s is normal, so the multiples
+    /// can never fire — and the ceiling is the only thing left. It must fire.
+    #[test]
+    fn a_baseline_learned_while_already_degraded_still_gets_caught_by_the_ceiling() {
+        let mut state = with_checks(&[vendor_api()]);
+        // Two hours of uniformly slow probes: the baseline is fully poisoned.
+        probe_steadily(&mut state, "vendor-api", STARTED, STARTED + 7_200, 3_000);
+
+        let now = at(STARTED + 7_200);
+        let assessments = evaluate(&state, now);
+
+        assert_eq!(
+            assessments.len(),
+            1,
+            "a poisoned baseline must not go quiet"
+        );
+
+        let Reason::Degraded {
+            trigger, baseline, ..
+        } = &assessments[0].reason
+        else {
+            panic!("expected a degradation, got {:?}", assessments[0].reason)
+        };
+
+        assert_eq!(
+            *trigger,
+            Trigger::Ceiling,
+            "the multiples cannot fire against a baseline this bad; the ceiling must"
+        );
+        assert!(
+            matches!(baseline, Baseline::NotCredible { .. }),
+            "the alert must say the baseline is worthless, not quote a reassuring \
+             ratio: {baseline:?}"
+        );
+    }
+
+    /// ...and it says so in words, rather than reporting a 1.0x ratio as if that
+    /// were reassuring.
+    #[test]
+    fn a_poisoned_baseline_is_named_in_the_alert_text() {
+        let mut state = with_checks(&[vendor_api()]);
+        probe_steadily(&mut state, "vendor-api", STARTED, STARTED + 7_200, 3_000);
+
+        let now = at(STARTED + 7_200);
+        let notification = crate::notify::render(&evaluate(&state, now)[0], now);
+
+        assert!(
+            notification.text.contains("learned that slow is normal"),
+            "{}",
+            notification.text
+        );
+    }
+
+    /// A dependency that recovered leaves a baseline worse than reality behind
+    /// it. That is worth knowing but is not an incident — it is the ordinary
+    /// state after every real slowdown clears, and paging on it would add a
+    /// message to every incident.
+    #[test]
+    fn a_baseline_much_worse_than_reality_is_reported_but_never_paged() {
+        let mut state = with_checks(&[vendor_api()]);
+        // An hour slow, then back to normal for the recent window.
+        probe_steadily(&mut state, "vendor-api", STARTED, STARTED + 3_600, 1_500);
+        probe_steadily(
+            &mut state,
+            "vendor-api",
+            STARTED + 3_630,
+            STARTED + 4_200,
+            90,
+        );
+
+        let now = at(STARTED + 4_200);
+
+        assert!(
+            evaluate(&state, now).is_empty(),
+            "a dependency getting faster is not an incident"
+        );
+        assert!(
+            matches!(
+                health_of(&state, "vendor-api", now),
+                CheckHealth::OkWithStaleBaseline { .. }
+            ),
+            "but it must not be reported as plainly ok: {:?}",
+            health_of(&state, "vendor-api", now)
+        );
+    }
+
+    /// A baseline sitting above the ceiling means the check cannot protect
+    /// anything, even while nothing is currently slow. That is the tool being
+    /// confidently wrong, and it gets said out loud.
+    #[test]
+    fn a_baseline_above_the_ceiling_is_alerted_even_when_nothing_is_slow_now() {
+        let mut state = with_checks(&[vendor_api()]);
+        // Baseline window learned at 2.5s — above the 2s ceiling.
+        probe_steadily(&mut state, "vendor-api", STARTED, STARTED + 3_600, 2_500);
+        // Recent window comfortably under the ceiling and near the baseline, so
+        // neither the ceiling nor the multiples fire.
+        probe_steadily(
+            &mut state,
+            "vendor-api",
+            STARTED + 3_630,
+            STARTED + 4_200,
+            1_900,
+        );
+
+        let now = at(STARTED + 4_200);
+        let assessments = evaluate(&state, now);
+
+        assert_eq!(assessments.len(), 1);
+        assert_eq!(assessments[0].severity, Severity::Warn);
+        assert!(
+            matches!(assessments[0].reason, Reason::BaselineNotCredible { .. }),
+            "got {:?}",
+            assessments[0].reason
+        );
+    }
+
+    /// One subject may only produce one assessment per cycle: the dispatcher
+    /// dedups on subject, so a second would be silently swallowed.
+    #[test]
+    fn a_check_never_produces_two_assessments_in_one_cycle() {
+        let mut state = with_checks(&[vendor_api()]);
+        probe_steadily(&mut state, "vendor-api", STARTED, STARTED + 7_200, 3_000);
+
+        let assessments = evaluate(&state, at(STARTED + 7_200));
+        assert_eq!(assessments.len(), 1);
+    }
+
+    // -- degradation against a healthy baseline ----------------------------
+
+    #[test]
+    fn latency_rising_against_its_own_baseline_warns_while_every_probe_succeeds() {
+        let mut state = with_checks(&[vendor_api()]);
+        probe_steadily(&mut state, "vendor-api", STARTED, STARTED + 3_600, 140);
+        // 4x the baseline: past warn, short of critical, and still 200 OK.
+        probe_steadily(
+            &mut state,
+            "vendor-api",
+            STARTED + 3_630,
+            STARTED + 4_200,
+            560,
+        );
+
+        let now = at(STARTED + 4_200);
+        let assessments = evaluate(&state, now);
+
+        assert_eq!(assessments.len(), 1);
+        assert_eq!(assessments[0].severity, Severity::Warn);
+
+        let Reason::Degraded { trigger, .. } = &assessments[0].reason else {
+            panic!("expected a degradation")
+        };
+        assert!(
+            matches!(trigger, Trigger::Baseline { ratio } if (*ratio - 4.0).abs() < 0.01),
+            "got {trigger:?}"
+        );
+    }
+
+    #[test]
+    fn a_big_enough_multiple_is_critical() {
+        let mut state = with_checks(&[vendor_api()]);
+        probe_steadily(&mut state, "vendor-api", STARTED, STARTED + 3_600, 140);
+        // 10x the baseline, still under the 2s ceiling.
+        probe_steadily(
+            &mut state,
+            "vendor-api",
+            STARTED + 3_630,
+            STARTED + 4_200,
+            1_400,
+        );
+
+        let assessments = evaluate(&state, at(STARTED + 4_200));
+
+        assert_eq!(assessments.len(), 1);
+        assert_eq!(assessments[0].severity, Severity::Critical);
+    }
+
+    #[test]
+    fn latency_inside_the_multiples_and_under_the_ceiling_is_not_an_alert() {
+        let mut state = with_checks(&[vendor_api()]);
+        probe_steadily(&mut state, "vendor-api", STARTED, STARTED + 3_600, 140);
+        // Doubled, which is noise for most dependencies and below warn_multiple.
+        probe_steadily(
+            &mut state,
+            "vendor-api",
+            STARTED + 3_630,
+            STARTED + 4_200,
+            280,
+        );
+
+        assert!(evaluate(&state, at(STARTED + 4_200)).is_empty());
+    }
+
+    /// The ceiling raises a verdict the multiples would have missed, and never
+    /// lowers one they caught.
+    #[test]
+    fn the_ceiling_and_the_multiples_take_the_worse_of_the_two() {
+        let mut state = with_checks(&[vendor_api()]);
+        probe_steadily(&mut state, "vendor-api", STARTED, STARTED + 3_600, 900);
+        // 2.5x the baseline — under warn_multiple — but past the 2s ceiling.
+        probe_steadily(
+            &mut state,
+            "vendor-api",
+            STARTED + 3_630,
+            STARTED + 4_200,
+            2_250,
+        );
+
+        let assessments = evaluate(&state, at(STARTED + 4_200));
+
+        assert_eq!(assessments.len(), 1);
+        assert_eq!(
+            assessments[0].severity,
+            Severity::Warn,
+            "the ceiling alone is worth a warning"
+        );
+    }
+
+    // -- down --------------------------------------------------------------
+
+    #[test]
+    fn a_single_failed_probe_is_not_an_outage() {
+        let mut state = with_checks(&[ping_only()]);
+        probe_steadily(&mut state, "queue-broker", STARTED, STARTED + 600, 90);
+        probe_failing(
+            &mut state,
+            "queue-broker",
+            STARTED + 630,
+            STARTED + 630,
+            "connection refused",
+        );
+
+        assert!(
+            evaluate(&state, at(STARTED + 630)).is_empty(),
+            "one blip must not page"
+        );
+    }
+
+    #[test]
+    fn unbroken_failure_for_down_after_is_critical() {
+        let mut state = with_checks(&[ping_only()]);
+        probe_steadily(&mut state, "queue-broker", STARTED, STARTED + 600, 90);
+        probe_failing(
+            &mut state,
+            "queue-broker",
+            STARTED + 630,
+            STARTED + 720,
+            "connection refused",
+        );
+
+        let now = at(STARTED + 720);
+        let assessments = evaluate(&state, now);
+
+        assert_eq!(assessments.len(), 1);
+        assert_eq!(assessments[0].severity, Severity::Critical);
+        assert_eq!(health_of(&state, "queue-broker", now), CheckHealth::Down);
+
+        let Reason::CheckDown {
+            last_error,
+            failed_probes,
+            ..
+        } = &assessments[0].reason
+        else {
+            panic!("expected a down reason")
+        };
+        assert_eq!(*failed_probes, 4);
+        assert_eq!(last_error, "connection refused");
+    }
+
+    /// A down check is down, not slow. Latency is not reported for something
+    /// that is not answering.
+    #[test]
+    fn a_down_check_reports_being_down_rather_than_degraded() {
+        let mut state = with_checks(&[vendor_api()]);
+        probe_steadily(&mut state, "vendor-api", STARTED, STARTED + 3_600, 140);
+        probe_failing(
+            &mut state,
+            "vendor-api",
+            STARTED + 3_630,
+            STARTED + 3_720,
+            "no response within 3s",
+        );
+
+        let assessments = evaluate(&state, at(STARTED + 3_720));
+
+        assert_eq!(assessments.len(), 1);
+        assert!(matches!(assessments[0].reason, Reason::CheckDown { .. }));
+    }
+
+    #[test]
+    fn a_check_with_no_degradation_block_is_never_judged_on_latency() {
+        let mut state = with_checks(&[ping_only()]);
+        // Two hours of appallingly slow but successful probes.
+        probe_steadily(&mut state, "queue-broker", STARTED, STARTED + 7_200, 30_000);
+
+        let now = at(STARTED + 7_200);
+        assert!(
+            evaluate(&state, now).is_empty(),
+            "a check that declared no degradation rules must never produce one"
+        );
+        assert_eq!(health_of(&state, "queue-broker", now), CheckHealth::Ok);
+    }
+
+    // -- purity ------------------------------------------------------------
+
+    #[test]
+    fn check_evaluation_depends_only_on_state_and_the_given_clock() {
+        let mut state = with_checks(&[vendor_api()]);
+        probe_steadily(&mut state, "vendor-api", STARTED, STARTED + 3_600, 140);
+        probe_steadily(
+            &mut state,
+            "vendor-api",
+            STARTED + 3_630,
+            STARTED + 4_200,
+            560,
+        );
+
+        let now = at(STARTED + 4_200);
+        assert_eq!(evaluate(&state, now), evaluate(&state, now));
+    }
+
+    #[test]
+    fn jobs_and_checks_are_assessed_together_in_a_fixed_order() {
+        let mut state = State::new(at(STARTED), &[scraper()], &[vendor_api()]);
+        probe_steadily(&mut state, "vendor-api", STARTED, STARTED + 7_200, 3_000);
+
+        let subjects: Vec<_> = evaluate(&state, at(STARTED + 7_200))
+            .into_iter()
+            .map(|a| a.subject)
+            .collect();
+
+        assert_eq!(subjects, ["product-scraper", "vendor-api"]);
     }
 
     #[test]

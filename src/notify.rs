@@ -19,7 +19,7 @@ use std::time::{Duration, SystemTime};
 use async_trait::async_trait;
 
 use crate::config::TelegramConfig;
-use crate::evaluate::{Assessment, LastSeen, Reason, Severity};
+use crate::evaluate::{Assessment, Baseline, LastSeen, Reason, Severity, Trigger};
 use crate::fmt;
 
 /// What a notification is about, from the reader's point of view.
@@ -108,24 +108,82 @@ pub trait Notifier: Send + Sync {
 
 /// Renders an assessment into the message a person will read.
 pub fn render(assessment: &Assessment, now: SystemTime) -> Notification {
-    let Reason::NoHeartbeat {
-        silent_for,
-        since,
-        expect_every,
-    } = &assessment.reason;
-
     let level = Level::from(assessment.severity);
-    let subject = &assessment.subject;
-    let every = fmt::duration(*expect_every);
+    let subject = assessment.subject.clone();
 
-    let text = match since {
+    let text = match &assessment.reason {
+        Reason::NoHeartbeat {
+            silent_for,
+            since,
+            expect_every,
+        } => render_no_heartbeat(&subject, level, *silent_for, since, *expect_every, now),
+
+        Reason::CheckDown {
+            failing_for,
+            failed_probes,
+            last_error,
+        } => render_check_down(&subject, level, *failing_for, *failed_probes, last_error),
+
+        Reason::Degraded {
+            recent_p90,
+            recent_window,
+            recent_samples,
+            baseline,
+            baseline_window,
+            absolute_ceiling,
+            trigger,
+        } => render_degraded(
+            &subject,
+            level,
+            *recent_p90,
+            *recent_window,
+            *recent_samples,
+            baseline,
+            *baseline_window,
+            *absolute_ceiling,
+            trigger,
+        ),
+
+        Reason::BaselineNotCredible {
+            baseline_p90,
+            baseline_samples,
+            baseline_window,
+            absolute_ceiling,
+        } => render_baseline_not_credible(
+            &subject,
+            level,
+            *baseline_p90,
+            *baseline_samples,
+            *baseline_window,
+            *absolute_ceiling,
+        ),
+    };
+
+    Notification {
+        subject,
+        level,
+        text,
+    }
+}
+
+fn render_no_heartbeat(
+    subject: &str,
+    level: Level,
+    silent_for: Duration,
+    since: &LastSeen,
+    expect_every: Duration,
+    now: SystemTime,
+) -> String {
+    let every = fmt::duration(expect_every);
+
+    match since {
         LastSeen::Beat(last) => format!(
             "{icon}  {subject} — no heartbeat for {silent}\n\
              \x20   last beat {last}, expected every {every}\n\
              \x20   stillwatch has been up for the whole gap — this is the job, not the watchdog\n\
              \x20   → the loop has stopped; the process has most likely exited or wedged",
             icon = level.icon(),
-            silent = fmt::duration(*silent_for),
+            silent = fmt::duration(silent_for),
             last = fmt::timestamp(*last, now),
         ),
         // Never claim a last-beat time that was never observed. "Nothing has
@@ -137,16 +195,110 @@ pub fn render(assessment: &Assessment, now: SystemTime) -> Notification {
              \x20   → either the job was already stopped when the watch began, or it has \
              never been wired up to send beats",
             icon = level.icon(),
-            silent = fmt::duration(*silent_for),
+            silent = fmt::duration(silent_for),
             started = fmt::timestamp(*started, now),
+        ),
+    }
+}
+
+fn render_check_down(
+    subject: &str,
+    level: Level,
+    failing_for: Duration,
+    failed_probes: usize,
+    last_error: &str,
+) -> String {
+    format!(
+        "{icon}  {subject} — down for {failing}\n\
+         \x20   {failed_probes} probes in a row failed; the last said: {last_error}\n\
+         \x20   → whatever depends on this is not getting answers, not getting slow answers",
+        icon = level.icon(),
+        failing = fmt::duration(failing_for),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_degraded(
+    subject: &str,
+    level: Level,
+    recent_p90: Duration,
+    recent_window: Duration,
+    recent_samples: usize,
+    baseline: &Baseline,
+    baseline_window: Duration,
+    absolute_ceiling: Duration,
+    trigger: &Trigger,
+) -> String {
+    let current = format!(
+        "p90 {p90} over the last {window} ({recent_samples} probes)",
+        p90 = fmt::latency(recent_p90),
+        window = fmt::duration(recent_window),
+    );
+
+    // What it is being compared against, and how much that comparison is worth.
+    let comparison = match baseline {
+        Baseline::Ready { p90, samples } => format!(
+            "baseline {baseline} over the {window} before that ({samples} probes)",
+            baseline = fmt::latency(*p90),
+            window = fmt::duration(baseline_window),
+        ),
+        Baseline::NotCredible { p90, samples } => format!(
+            "baseline {baseline} over {samples} probes — but that is itself past the \
+             {ceiling} ceiling, so the baseline has learned that slow is normal and \
+             the multiples cannot fire",
+            baseline = fmt::latency(*p90),
+            ceiling = fmt::latency(absolute_ceiling),
+        ),
+        Baseline::Warming { samples, needed } => format!(
+            "no baseline yet ({samples} of {needed} probes), so this is the \
+             {ceiling} ceiling alone",
+            ceiling = fmt::latency(absolute_ceiling),
         ),
     };
 
-    Notification {
-        subject: subject.clone(),
-        level,
-        text,
-    }
+    let implication = match trigger {
+        Trigger::Ceiling => format!(
+            "→ past the {ceiling} you said was unacceptable; everything downstream is \
+             waiting that long",
+            ceiling = fmt::latency(absolute_ceiling),
+        ),
+        Trigger::Baseline { ratio } | Trigger::Both { ratio } => format!(
+            "→ {ratio:.1}x its own normal; everything downstream is that much slower and \
+             nothing else would have said so"
+        ),
+    };
+
+    format!(
+        "{icon}  {subject} — degraded\n\
+         \x20   {current}, {comparison}\n\
+         \x20   still responding · this is latency, not an outage\n\
+         \x20   {implication}",
+        icon = level.icon(),
+    )
+}
+
+fn render_baseline_not_credible(
+    subject: &str,
+    level: Level,
+    baseline_p90: Duration,
+    baseline_samples: usize,
+    baseline_window: Duration,
+    absolute_ceiling: Duration,
+) -> String {
+    format!(
+        "{icon}  {subject} — responding, but its baseline cannot be trusted\n\
+         \x20   baseline p90 {baseline} over {samples} probes in the last {window}, \
+         which is past the {ceiling} ceiling\n\
+         \x20   nothing is failing · latency is under the ceiling right now\n\
+         \x20   → this check learned its normal during a slow stretch, so a real \
+         slowdown would not trip the multiples; widen the window, lower the ceiling, \
+         or restart once the dependency is behaving",
+        icon = level.icon(),
+        baseline = fmt::latency(baseline_p90),
+        samples = baseline_samples,
+        window = fmt::duration(baseline_window),
+        ceiling = fmt::latency(absolute_ceiling),
+    )
 }
 
 /// Renders the all-clear for an incident that has ended.

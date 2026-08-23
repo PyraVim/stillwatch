@@ -36,6 +36,29 @@ pub fn duration(d: Duration) -> String {
     out
 }
 
+/// Renders a latency at the precision a person compares latencies at.
+///
+/// `90ms`, `1.4s`, `2s`, `18m4s`. Separate from [`duration`] because that one
+/// counts in whole seconds and would render every healthy response time as
+/// `0s`, which is exactly the number a degradation alert must not print.
+pub fn latency(d: Duration) -> String {
+    let millis = d.as_millis();
+
+    if millis == 0 {
+        // A sub-millisecond response is real; claiming 0ms is not.
+        return "<1ms".to_string();
+    }
+    if millis < 1_000 {
+        return format!("{millis}ms");
+    }
+    if d.as_secs() < 60 {
+        let seconds = format!("{:.1}", d.as_secs_f64());
+        return format!("{}s", seconds.strip_suffix(".0").unwrap_or(&seconds));
+    }
+
+    duration(d)
+}
+
 /// Renders a wall-clock timestamp in local time, always with a UTC offset.
 ///
 /// Same day as `now` gives `14:32:07 -04:00`; anything older carries the date

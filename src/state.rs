@@ -143,6 +143,11 @@ impl CheckState {
         self.observations.back()
     }
 
+    /// Every observation, most recent first.
+    pub fn newest_first(&self) -> impl Iterator<Item = &Observation> {
+        self.observations.iter().rev()
+    }
+
     pub fn observation_count(&self) -> usize {
         self.observations.len()
     }
