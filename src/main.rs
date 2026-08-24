@@ -12,7 +12,7 @@ use stillwatch::config::{self, Config, ConfigError, SystemEnv};
 use stillwatch::evaluate::{check_health, evaluate, unjudged_signals, CheckHealth, UnjudgedSignal};
 use stillwatch::notify::{Dispatcher, DryRun, LogOnly, Notifier, Telegram};
 use stillwatch::state::{SharedState, State};
-use stillwatch::{fmt, learn, prober, receiver};
+use stillwatch::{fmt, learn, passive, prober, receiver};
 use tokio::time::MissedTickBehavior;
 use tracing_subscriber::EnvFilter;
 
@@ -135,13 +135,21 @@ async fn observe(
         .build()
         .map_err(StartupError::Client)?;
 
-    let probers = config
+    let mut watchers: Vec<tokio::task::JoinHandle<()>> = config
         .checks
         .iter()
         .map(|check| tokio::spawn(prober::run(check.clone(), client.clone(), state.clone())))
         .collect();
 
-    Ok((listener, probers))
+    watchers.extend(
+        config
+            .jobs
+            .iter()
+            .filter(|job| job.is_passive())
+            .map(|job| tokio::spawn(passive::run(job.clone(), state.clone()))),
+    );
+
+    Ok((listener, watchers))
 }
 
 async fn watch_mode(config: Config, dry_run: bool) -> Result<(), StartupError> {
@@ -394,6 +402,36 @@ fn describe(config: &Config) {
                 min = %fmt::percent(ratio.min),
                 min_sample = ratio.min_sample,
                 "watching a counter ratio"
+            );
+        }
+
+        if let Some(watch) = &job.process {
+            tracing::info!(
+                job = %job.name,
+                pidfile = %watch.pidfile.display(),
+                absent_after = %fmt::duration(watch.absent_after),
+                "watching a pidfile — an indirect signal: it says a process id exists, \
+                 not that the job is doing anything"
+            );
+        }
+
+        if let Some(watch) = &job.log {
+            tracing::info!(
+                job = %job.name,
+                path = %watch.path.display(),
+                stale_after = %fmt::duration(watch.stale_after),
+                error_regex = watch.error_regex.as_ref().map(|r| r.as_str()),
+                "watching a log; it is followed across rotation"
+            );
+        }
+
+        if let Some(watch) = &job.artifact {
+            tracing::info!(
+                job = %job.name,
+                path = %watch.path.display(),
+                stale_after = %fmt::duration(watch.stale_after),
+                min_bytes = watch.min_bytes,
+                "watching an output file"
             );
         }
     }

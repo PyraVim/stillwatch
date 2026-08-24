@@ -299,6 +299,72 @@ independent and each gets its own message and its own all-clear.
 
 ---
 
+## Watching something you can't modify
+
+Nobody adds code to a job before they trust the tool, and a consultant can't
+modify a client's system before being hired. Passive mode watches from outside —
+no heartbeats, nothing to change:
+
+```toml
+[[job]]
+name = "clients-etl"
+mode = "passive"
+
+  [job.process]
+  pidfile      = "/var/run/etl.pid"
+  absent_after = "60s"                 # a restart briefly removes the pidfile
+
+  [job.log]
+  path        = "/var/log/etl.log"
+  stale_after = "10m"
+  error_regex = "(?i)(traceback|fatal|failed to write)"
+
+  [job.artifact]
+  path        = "/data/exports/daily.csv"
+  stale_after = "26h"
+  min_bytes   = 1024                   # a fresh but empty export is the failure
+```
+
+**These signals are weaker than a heartbeat, and every alert says so inline** —
+not just here, because nobody reads the README at three in the morning. A
+pidfile says a process id exists. A log says bytes were written. An artifact
+says a file has a size. None of them says the job did its work.
+
+The distinctions the tool keeps, because each sends you somewhere different:
+
+* a log that **never existed** is a wrong path in the config; one that
+  **existed and stopped moving** is a stuck job
+* a pidfile **absent since stillwatch started** might be a dead job or one not
+  started yet — the alert says both rather than guessing
+* an artifact that is **fresh but empty** is reported as empty, not stale. Its
+  age is beside the point; that's the run that exited zero and wrote nothing
+* a line matching `error_regex` outranks everything else here — it's the job's
+  own words rather than an inference about it
+
+### Log rotation
+
+Tail a log by holding its handle and a rotation leaves you reading a dead inode
+forever: the log looks permanently stale while the job is fine. That's precisely
+the failure this tool exists to catch, so shipping it *inside* the tool would be
+embarrassing.
+
+stillwatch stats the path rather than holding a handle, and detects replacement
+two independent ways — file identity (`inode` on Unix, the file index on
+Windows) and a size that went backwards. Either one catches `logrotate`'s
+rename-and-recreate; the second independently catches `copytruncate`.
+
+Two limits worth stating plainly:
+
+* **PID reuse.** A pidfile whose number has been recycled by an unrelated
+  process reads as healthy. There's no portable fix. Treat `[job.process]` as
+  "probably up", not "up" — which is why it's the weakest of the three.
+* **A writer that keeps the old handle.** If a log is rotated but the process
+  goes on writing to the old file without reopening, the new file at the path
+  looks fresh and empty while the real output goes elsewhere. Nothing visible
+  from the path can tell.
+
+---
+
 ## Don't guess your thresholds
 
 A watchdog with wrong thresholds is worse than none. It either pages you

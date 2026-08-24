@@ -173,6 +173,63 @@ name = "nightly-sync"
 
 
 # ---------------------------------------------------------------------------
+# Watching something you cannot modify
+# ---------------------------------------------------------------------------
+#
+# Nobody adds code to a job before they trust the tool, and a consultant cannot
+# modify a client's system before being hired. Passive mode watches from
+# outside: no heartbeats, nothing to change.
+#
+# These signals are WEAKER than a heartbeat, and stillwatch says so in every
+# alert rather than only here. A pidfile says a process id exists. A log says
+# bytes were written. An artifact says a file has a size. None of them says the
+# job did its work.
+#
+# `mode = "passive"` is a declaration of intent. It is what lets stillwatch
+# reject the contradiction of a job that sends no heartbeats being judged on
+# missing them. A job may perfectly well beat *and* have its output watched —
+# just leave the mode alone in that case.
+
+[[job]]
+name = "clients-etl"
+mode = "passive"
+
+  # Is the process there at all?
+  #
+  # The weakest of the three. It says a process with that id exists — not that
+  # it is your process. Process ids get reused, so a stale pidfile whose number
+  # has been handed to something unrelated reads as healthy. There is no
+  # portable fix; treat this as "probably up", not "up".
+  [job.process]
+  pidfile      = "/var/run/etl.pid"
+  absent_after = "60s"    # optional; a restart briefly removes the pidfile
+
+  # Is the log still moving, and is it saying anything bad?
+  #
+  # Followed across rotation: stillwatch stats the path rather than holding a
+  # handle, and notices when the file is replaced or truncated so the tail
+  # restarts at the top of the new one. A held handle would leave a perfectly
+  # healthy job looking permanently stale.
+  #
+  # A line matching error_regex is the strongest signal here, because it is the
+  # job's own words rather than an inference about it.
+  [job.log]
+  path        = "/var/log/etl.log"
+  stale_after = "10m"
+  error_regex = "(?i)(traceback|fatal|failed to write)"
+
+  # Is the output actually being produced?
+  #
+  # min_bytes catches the run that completed, exited zero and wrote nothing —
+  # a fresh but empty file is reported as empty, not as stale, because its age
+  # is beside the point.
+  [job.artifact]
+  path        = "/data/exports/daily.csv"
+  stale_after = "26h"
+  min_bytes   = 1024
+
+
+# ---------------------------------------------------------------------------
 # A dependency, probed directly
 # ---------------------------------------------------------------------------
 #
@@ -235,7 +292,6 @@ down_after = "60s"
 # Not yet implemented
 # ---------------------------------------------------------------------------
 #
-# Every block above is evaluated. Config for anything else — passive mode's
-# [job.process], [job.log], [job.artifact] — parses without error but is not
+# Every block above is evaluated. Anything else parses without error but is not
 # acted on, and stillwatch logs a warning at startup naming each key it is
 # ignoring, so a line that does nothing never does so quietly.

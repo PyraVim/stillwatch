@@ -2175,6 +2175,531 @@ mod tests {
         assert!(matches!(assessments[0].reason, Reason::NoHeartbeat { .. }));
     }
 
+    // -- passive mode ------------------------------------------------------
+
+    use crate::config::{ArtifactWatch, LogWatch, ProcessWatch};
+    use crate::state::LogSample;
+
+    fn etl_with_process() -> JobConfig {
+        JobConfig {
+            process: Some(ProcessWatch {
+                pidfile: PathBuf::from("/var/run/etl.pid"),
+                absent_after: Duration::from_secs(60),
+            }),
+            ..JobConfig::named("clients-etl")
+        }
+    }
+
+    fn etl_with_log() -> JobConfig {
+        JobConfig {
+            log: Some(LogWatch {
+                path: PathBuf::from("/var/log/etl.log"),
+                stale_after: Duration::from_secs(600),
+                error_regex: None,
+            }),
+            ..JobConfig::named("clients-etl")
+        }
+    }
+
+    fn etl_with_artifact(min_bytes: u64) -> JobConfig {
+        JobConfig {
+            artifact: Some(ArtifactWatch {
+                path: PathBuf::from("/data/exports/daily.csv"),
+                stale_after: Duration::from_secs(26 * 3_600),
+                min_bytes,
+            }),
+            ..JobConfig::named("clients-etl")
+        }
+    }
+
+    fn present(size: u64, modified: u64) -> FileFinding {
+        FileFinding::Present {
+            size,
+            modified: Some(at(modified)),
+        }
+    }
+
+    // -- process: the dead-on-arrival question -----------------------------
+
+    /// Nothing has looked yet. Not knowing is not the same as finding nothing.
+    #[test]
+    fn a_process_watch_says_nothing_before_the_first_look() {
+        let state = state(&[etl_with_process()]);
+        assert!(evaluate(&state, at(STARTED + 10_000)).is_empty());
+    }
+
+    /// A pidfile absent at startup is ambiguous — dead, or not started yet —
+    /// and the alert says both rather than picking one and being wrong half the
+    /// time.
+    #[test]
+    fn a_pidfile_never_seen_is_measured_from_process_start_and_says_so() {
+        let mut state = state(&[etl_with_process()]);
+        state.record_process(
+            "clients-etl",
+            at(STARTED + 5),
+            ProcessFinding::PidfileMissing,
+        );
+
+        assert!(
+            evaluate(&state, at(STARTED + 30)).is_empty(),
+            "inside absent_after there is nothing to say yet"
+        );
+
+        let assessments = evaluate(&state, at(STARTED + 90));
+        assert_eq!(assessments.len(), 1);
+
+        let Reason::ProcessAbsent { since, detail, .. } = &assessments[0].reason else {
+            panic!("expected a process reason, got {:?}", assessments[0].reason)
+        };
+        assert_eq!(*since, LastSeen::WatchdogStart(at(STARTED)));
+        assert_eq!(
+            *detail,
+            ProcessAbsence::PidfileMissing {
+                existed_before: false
+            }
+        );
+
+        let text = crate::notify::render(&assessments[0], at(STARTED + 90)).text;
+        assert!(
+            text.contains("never seen running since the watch began"),
+            "{text}"
+        );
+        assert!(text.contains("has not started"), "{text}");
+        assert!(text.contains("path in the config is wrong"), "{text}");
+    }
+
+    /// A pidfile that was there and went away is a different fact, and reads
+    /// differently.
+    #[test]
+    fn a_pidfile_that_disappears_is_told_apart_from_one_that_never_was() {
+        let mut state = state(&[etl_with_process()]);
+        state.record_process(
+            "clients-etl",
+            at(STARTED + 5),
+            ProcessFinding::Running { pid: 4_242 },
+        );
+        state.record_process(
+            "clients-etl",
+            at(STARTED + 200),
+            ProcessFinding::PidfileMissing,
+        );
+
+        let assessments = evaluate(&state, at(STARTED + 300));
+        let Reason::ProcessAbsent { since, detail, .. } = &assessments[0].reason else {
+            panic!("expected a process reason")
+        };
+
+        assert_eq!(*since, LastSeen::Observed(at(STARTED + 5)));
+        assert_eq!(
+            *detail,
+            ProcessAbsence::PidfileMissing {
+                existed_before: true
+            }
+        );
+
+        let text = crate::notify::render(&assessments[0], at(STARTED + 300)).text;
+        assert!(text.contains("last seen running"), "{text}");
+        assert!(!text.contains("has not started"), "{text}");
+    }
+
+    #[test]
+    fn a_pidfile_naming_a_dead_process_names_the_pid() {
+        let mut state = state(&[etl_with_process()]);
+        state.record_process(
+            "clients-etl",
+            at(STARTED + 5),
+            ProcessFinding::NotRunning { pid: 4_242 },
+        );
+
+        let assessments = evaluate(&state, at(STARTED + 200));
+        assert_eq!(assessments[0].severity, Severity::Critical);
+
+        let text = crate::notify::render(&assessments[0], at(STARTED + 200)).text;
+        assert!(text.contains("process 4242 is gone"), "{text}");
+        assert!(text.contains("did not exit on purpose"), "{text}");
+    }
+
+    #[test]
+    fn a_running_process_is_not_an_alert() {
+        let mut state = state(&[etl_with_process()]);
+        state.record_process(
+            "clients-etl",
+            at(STARTED + 5),
+            ProcessFinding::Running { pid: 4_242 },
+        );
+
+        assert!(evaluate(&state, at(STARTED + 100_000)).is_empty());
+    }
+
+    /// A restart briefly removes the pidfile. That must not page.
+    #[test]
+    fn a_brief_pidfile_gap_during_a_restart_does_not_page() {
+        let mut state = state(&[etl_with_process()]);
+        state.record_process(
+            "clients-etl",
+            at(STARTED + 5),
+            ProcessFinding::Running { pid: 1 },
+        );
+        state.record_process(
+            "clients-etl",
+            at(STARTED + 20),
+            ProcessFinding::PidfileMissing,
+        );
+
+        assert!(evaluate(&state, at(STARTED + 35)).is_empty());
+    }
+
+    /// An unreadable pidfile is stillwatch's problem, and the alert says so
+    /// rather than blaming the job.
+    #[test]
+    fn an_unreadable_pidfile_blames_the_watcher_not_the_job() {
+        let mut state = state(&[etl_with_process()]);
+        state.record_process(
+            "clients-etl",
+            at(STARTED + 5),
+            ProcessFinding::PidfileUnreadable("permission denied".into()),
+        );
+
+        let assessments = evaluate(&state, at(STARTED + 200));
+        let text = crate::notify::render(&assessments[0], at(STARTED + 200)).text;
+
+        assert!(text.contains("permission denied"), "{text}");
+        assert!(
+            text.contains("stillwatch's problem, not the job's"),
+            "{text}"
+        );
+    }
+
+    // -- files: never existed is not stopped moving ------------------------
+
+    #[test]
+    fn a_log_that_has_never_existed_reads_differently_from_one_that_vanished() {
+        let mut never = state(&[etl_with_log()]);
+        never.record_log(
+            "clients-etl",
+            at(STARTED + 5),
+            LogSample {
+                finding: FileFinding::Missing,
+                rotated: false,
+                error_line: None,
+            },
+        );
+
+        let assessments = evaluate(&never, at(STARTED + 700));
+        let Reason::FileMissing { detail, .. } = &assessments[0].reason else {
+            panic!(
+                "expected a missing-file reason, got {:?}",
+                assessments[0].reason
+            )
+        };
+        assert_eq!(
+            *detail,
+            FileAbsence::NotThere {
+                existed_before: false
+            }
+        );
+
+        let text = crate::notify::render(&assessments[0], at(STARTED + 700)).text;
+        assert!(text.contains("has never appeared"), "{text}");
+        assert!(text.contains("path in the config is wrong"), "{text}");
+
+        // The same absence, after the file had been seen, points elsewhere.
+        let mut vanished = state(&[etl_with_log()]);
+        vanished.record_log(
+            "clients-etl",
+            at(STARTED + 5),
+            LogSample {
+                finding: present(400, STARTED),
+                rotated: false,
+                error_line: None,
+            },
+        );
+        vanished.record_log(
+            "clients-etl",
+            at(STARTED + 10),
+            LogSample {
+                finding: FileFinding::Missing,
+                rotated: false,
+                error_line: None,
+            },
+        );
+
+        let assessments = evaluate(&vanished, at(STARTED + 700));
+        let text = crate::notify::render(&assessments[0], at(STARTED + 700)).text;
+        assert!(text.contains("has disappeared"), "{text}");
+        assert!(text.contains("deleted or moved"), "{text}");
+    }
+
+    /// A log that has never appeared gets a grace period first: at startup, a
+    /// file not yet created is not yet a finding.
+    #[test]
+    fn a_log_not_yet_created_is_given_its_stale_window_first() {
+        let mut state = state(&[etl_with_log()]);
+        state.record_log(
+            "clients-etl",
+            at(STARTED + 5),
+            LogSample {
+                finding: FileFinding::Missing,
+                rotated: false,
+                error_line: None,
+            },
+        );
+
+        assert!(evaluate(&state, at(STARTED + 300)).is_empty());
+        assert!(!evaluate(&state, at(STARTED + 700)).is_empty());
+    }
+
+    #[test]
+    fn a_log_that_stopped_moving_is_stale_not_missing() {
+        let mut state = state(&[etl_with_log()]);
+        state.record_log(
+            "clients-etl",
+            at(STARTED + 5),
+            LogSample {
+                finding: present(4_000, STARTED),
+                rotated: false,
+                error_line: None,
+            },
+        );
+
+        assert!(evaluate(&state, at(STARTED + 500)).is_empty());
+
+        let assessments = evaluate(&state, at(STARTED + 700));
+        assert!(matches!(assessments[0].reason, Reason::FileStale { .. }));
+
+        let text = crate::notify::render(&assessments[0], at(STARTED + 700)).text;
+        assert!(text.contains("has not changed in"), "{text}");
+        assert!(
+            text.contains("wedged, idle, or logging somewhere else"),
+            "{text}"
+        );
+    }
+
+    /// Staleness follows the live file, so a rotation resets the clock rather
+    /// than leaving a healthy job looking permanently stuck.
+    #[test]
+    fn a_rotated_log_is_judged_on_the_new_file() {
+        let mut state = state(&[etl_with_log()]);
+        state.record_log(
+            "clients-etl",
+            at(STARTED + 5),
+            LogSample {
+                finding: present(900_000, STARTED),
+                rotated: false,
+                error_line: None,
+            },
+        );
+        assert!(!evaluate(&state, at(STARTED + 700)).is_empty());
+
+        // Rotated: a fresh, small file with a recent write.
+        state.record_log(
+            "clients-etl",
+            at(STARTED + 705),
+            LogSample {
+                finding: present(120, STARTED + 700),
+                rotated: true,
+                error_line: None,
+            },
+        );
+
+        assert!(
+            evaluate(&state, at(STARTED + 710)).is_empty(),
+            "the replacement is moving, so the job is fine"
+        );
+    }
+
+    #[test]
+    fn a_rotation_is_mentioned_when_the_new_file_does_go_stale() {
+        let mut state = state(&[etl_with_log()]);
+        state.record_log(
+            "clients-etl",
+            at(STARTED + 5),
+            LogSample {
+                finding: present(120, STARTED),
+                rotated: true,
+                error_line: None,
+            },
+        );
+
+        let assessments = evaluate(&state, at(STARTED + 700));
+        let text = crate::notify::render(&assessments[0], at(STARTED + 700)).text;
+
+        assert!(text.contains("rotated once while being watched"), "{text}");
+    }
+
+    // -- the job's own words ------------------------------------------------
+
+    /// A traceback the job logged outranks the file being stale: one is a
+    /// cause, the other a symptom.
+    #[test]
+    fn an_error_the_job_logged_outranks_the_file_being_stale() {
+        let mut state = state(&[etl_with_log()]);
+        state.record_log(
+            "clients-etl",
+            at(STARTED + 100),
+            LogSample {
+                finding: present(4_000, STARTED),
+                rotated: false,
+                error_line: Some("FATAL: failed to write batch 7".into()),
+            },
+        );
+
+        let assessments = evaluate(&state, at(STARTED + 300));
+        assert_eq!(assessments.len(), 1);
+        assert!(matches!(assessments[0].reason, Reason::LoggedError { .. }));
+
+        let text = crate::notify::render(&assessments[0], at(STARTED + 300)).text;
+        assert!(text.contains("failed to write batch 7"), "{text}");
+        assert!(
+            text.contains("the job said this about itself"),
+            "the strongest passive signal should say so: {text}"
+        );
+    }
+
+    // -- artifacts ---------------------------------------------------------
+
+    #[test]
+    fn an_artifact_that_is_fresh_and_big_enough_is_not_an_alert() {
+        let mut state = state(&[etl_with_artifact(1_024)]);
+        state.record_artifact("clients-etl", present(80_000, STARTED));
+
+        assert!(evaluate(&state, at(STARTED + 3_600)).is_empty());
+    }
+
+    /// The classic "ran, exited zero, wrote nothing". Its age is beside the
+    /// point — a fresh empty file is the failure.
+    #[test]
+    fn a_fresh_but_empty_artifact_is_reported_as_empty_not_stale() {
+        let mut state = state(&[etl_with_artifact(1_024)]);
+        state.record_artifact("clients-etl", present(12, STARTED + 3_500));
+
+        let assessments = evaluate(&state, at(STARTED + 3_600));
+        assert_eq!(assessments.len(), 1);
+        assert!(matches!(
+            assessments[0].reason,
+            Reason::ArtifactTooSmall { .. }
+        ));
+
+        let text = crate::notify::render(&assessments[0], at(STARTED + 3_600)).text;
+        assert!(text.contains("nearly empty"), "{text}");
+        assert!(
+            text.contains("not a stale artifact, it is an empty one"),
+            "{text}"
+        );
+        assert!(text.contains("exits zero"), "{text}");
+    }
+
+    #[test]
+    fn an_artifact_older_than_stale_after_is_stale() {
+        let mut state = state(&[etl_with_artifact(0)]);
+        state.record_artifact("clients-etl", present(80_000, STARTED));
+
+        assert!(evaluate(&state, at(STARTED + 25 * 3_600)).is_empty());
+
+        let assessments = evaluate(&state, at(STARTED + 27 * 3_600));
+        assert!(matches!(assessments[0].reason, Reason::FileStale { .. }));
+    }
+
+    /// No modification time means nothing to judge against. Reporting it as
+    /// fresh would be the comfortable lie.
+    #[test]
+    fn a_file_with_no_modification_time_is_unjudged_rather_than_fresh() {
+        let mut state = state(&[etl_with_artifact(0)]);
+        state.record_artifact(
+            "clients-etl",
+            FileFinding::Present {
+                size: 80_000,
+                modified: None,
+            },
+        );
+
+        assert!(evaluate(&state, at(STARTED + 100 * 3_600)).is_empty());
+    }
+
+    // -- every passive alert admits what it is -----------------------------
+
+    /// Somebody who has only ever seen these alerts must not come away
+    /// trusting a pidfile as much as a heartbeat.
+    #[test]
+    fn every_passive_alert_says_the_signal_is_indirect() {
+        let mut state = state(&[JobConfig {
+            process: etl_with_process().process,
+            log: etl_with_log().log,
+            artifact: etl_with_artifact(1_024).artifact,
+            ..JobConfig::named("clients-etl")
+        }]);
+
+        state.record_process(
+            "clients-etl",
+            at(STARTED + 5),
+            ProcessFinding::PidfileMissing,
+        );
+        state.record_log(
+            "clients-etl",
+            at(STARTED + 5),
+            LogSample {
+                finding: present(4_000, STARTED),
+                rotated: false,
+                error_line: None,
+            },
+        );
+        state.record_artifact("clients-etl", present(12, STARTED + 3_000));
+
+        let now = at(STARTED + 4_000);
+        let assessments = evaluate(&state, now);
+        assert_eq!(assessments.len(), 3, "{assessments:?}");
+
+        for assessment in &assessments {
+            let text = crate::notify::render(assessment, now).text;
+            assert!(
+                text.contains("weaker signal than a heartbeat"),
+                "a passive alert must not read as strongly as a heartbeat: {text}"
+            );
+            assert!(
+                text.lines()
+                    .last()
+                    .unwrap_or_default()
+                    .trim_start()
+                    .starts_with('→'),
+                "{text}"
+            );
+        }
+    }
+
+    /// Passive findings are independent of each other and each is its own
+    /// incident.
+    #[test]
+    fn passive_findings_are_separate_conditions() {
+        let mut state = state(&[JobConfig {
+            process: etl_with_process().process,
+            artifact: etl_with_artifact(1_024).artifact,
+            ..JobConfig::named("clients-etl")
+        }]);
+
+        state.record_process(
+            "clients-etl",
+            at(STARTED + 5),
+            ProcessFinding::NotRunning { pid: 7 },
+        );
+        state.record_artifact("clients-etl", present(4, STARTED + 3_000));
+
+        let conditions: Vec<_> = evaluate(&state, at(STARTED + 4_000))
+            .iter()
+            .map(|a| a.reason.condition())
+            .collect();
+
+        assert_eq!(
+            conditions,
+            [Condition::ProcessAbsent, Condition::ArtifactTooSmall]
+        );
+    }
+
+    #[test]
+    fn a_job_with_no_passive_blocks_is_never_judged_on_files() {
+        let state = state(&[nightly()]);
+        assert!(evaluate(&state, at(STARTED + 365 * 24 * 3_600)).is_empty());
+    }
+
     // -- checks: fixtures --------------------------------------------------
 
     use crate::config::{CheckConfig, DegradationConfig, ProbeConfig};
