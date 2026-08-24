@@ -1,5 +1,7 @@
 # stillwatch
 
+[![ci](https://github.com/PyraVim/stillwatch/actions/workflows/ci.yml/badge.svg)](https://github.com/PyraVim/stillwatch/actions/workflows/ci.yml)
+
 **A watchdog for things that run without you.**
 
 Not "is the process up." That's the least interesting failure, and the one you'd
@@ -591,7 +593,7 @@ clients-etl       uptime  99.7%   1 incident   longest 33m20s
 product-scraper   uptime  99.6%   3 incidents   longest 18m4s
 vendor-api        uptime  99.6%   1 incident   longest 41m
 
-watched 165h of the last 168h · 3h unaccounted for (stillwatch was not running, or stopped without recording it)
+watched 6d20h of the last 7d · 3h unaccounted for (stillwatch was not running, or stopped without recording it)
 percentages above are of the watched time only
 ```
 
@@ -612,8 +614,8 @@ Three cases it distinguishes rather than guessing at:
   everything after is unknown. The report says "or stopped without recording it".
 * **No coverage at all.** `uptime unknown`. Not 0% and not 100%: if nothing was
   watching there's no percentage to give, and a window with no records at all
-  reads as "no record of watching any of the last 168h, every number above is
-  unknown rather than good".
+  reads as `stillwatch has no record of watching any of the last 7d — every
+  number above is unknown rather than good`.
 
 Only subjects that had at least one incident appear in the report. A job that
 never failed has no records to summarise.

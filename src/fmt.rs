@@ -36,6 +36,39 @@ pub fn duration(d: Duration) -> String {
     out
 }
 
+/// Renders a stretch of calendar time the way a report should read it: the two
+/// most significant non-zero units, days included.
+///
+/// `7d`, `6d21h`, `33m20s`, `0s`.
+///
+/// This is [`duration`] with days added, and it exists because the two numbers
+/// are answering different questions. An alert duration is compared against a
+/// threshold the reader wrote in hours, so `27h` beats `1d3h`. A report span is
+/// a piece of the calendar being described back to someone, and nobody reading
+/// a weekly summary thinks in units of 168 hours. Anything under a day renders
+/// identically either way.
+pub fn span(d: Duration) -> String {
+    let total = d.as_secs();
+    let units = [
+        (total / 86_400, 'd'),
+        ((total % 86_400) / 3_600, 'h'),
+        ((total % 3_600) / 60, 'm'),
+        (total % 60, 's'),
+    ];
+
+    let Some(first) = units.iter().position(|(value, _)| *value > 0) else {
+        return "0s".to_string();
+    };
+
+    let mut out = String::new();
+    for (value, unit) in units.iter().skip(first).take(2) {
+        if *value > 0 {
+            out.push_str(&format!("{value}{unit}"));
+        }
+    }
+    out
+}
+
 /// Renders a latency at the precision a person compares latencies at.
 ///
 /// `90ms`, `1.4s`, `2s`, `18m4s`. Separate from [`duration`] because that one
@@ -153,6 +186,33 @@ mod tests {
     fn duration_of_less_than_a_second_is_zero() {
         assert_eq!(duration(Duration::ZERO), "0s");
         assert_eq!(duration(Duration::from_millis(400)), "0s");
+    }
+
+    #[test]
+    fn a_report_span_counts_in_days() {
+        assert_eq!(span(Duration::from_secs(7 * 86_400)), "7d");
+        assert_eq!(span(Duration::from_secs(165 * 3_600)), "6d21h");
+        assert_eq!(span(Duration::from_secs(50 * 3_600)), "2d2h");
+    }
+
+    /// The reason `span` can be dropped into the report without rewriting every
+    /// sample: below a day the two formatters are the same function. Only the
+    /// window-sized numbers change, which is the whole point of adding it.
+    #[test]
+    fn a_span_under_a_day_reads_exactly_like_an_alert_duration() {
+        for secs in [0, 1, 59, 60, 312, 1_084, 2_460, 3_600, 3_930, 86_399] {
+            let d = Duration::from_secs(secs);
+            assert_eq!(span(d), duration(d), "disagreed at {secs}s");
+        }
+    }
+
+    /// A day and a bit is where the two deliberately part company.
+    #[test]
+    fn a_span_of_whole_days_drops_the_empty_hours() {
+        assert_eq!(span(Duration::from_secs(86_400)), "1d");
+        assert_eq!(span(Duration::from_secs(86_401)), "1d");
+        assert_eq!(span(Duration::from_secs(90_061)), "1d1h");
+        assert_eq!(duration(Duration::from_secs(90_061)), "25h1m");
     }
 
     #[test]

@@ -664,7 +664,7 @@ pub fn render_report(report: &Report) -> String {
         let longest = if subject.longest.is_zero() {
             String::new()
         } else {
-            format!("   longest {}", crate::fmt::duration(subject.longest))
+            format!("   longest {}", crate::fmt::span(subject.longest))
         };
 
         out.push_str(&format!(
@@ -687,15 +687,12 @@ fn coverage_line(report: &Report) -> String {
         return format!(
             "stillwatch has no record of watching any of the last {} — every number \
              above is unknown rather than good\n",
-            crate::fmt::duration(window),
+            crate::fmt::span(window),
         );
     }
 
     if report.unknown.is_zero() {
-        return format!(
-            "watched all {} of this window\n",
-            crate::fmt::duration(window)
-        );
+        return format!("watched all {} of this window\n", crate::fmt::span(window));
     }
 
     let cause = if report.unclean_shutdowns > 0 {
@@ -707,9 +704,9 @@ fn coverage_line(report: &Report) -> String {
     format!(
         "watched {} of the last {} · {} unaccounted for ({cause})\n\
          percentages above are of the watched time only\n",
-        crate::fmt::duration(report.watched),
-        crate::fmt::duration(window),
-        crate::fmt::duration(report.unknown),
+        crate::fmt::span(report.watched),
+        crate::fmt::span(window),
+        crate::fmt::span(report.unknown),
     )
 }
 
@@ -908,7 +905,7 @@ mod tests {
         assert!((uptime - (1.0 - 1_000.0 / DAY as f64)).abs() < 1e-9);
 
         let rendered = render_report(&report);
-        assert!(rendered.contains("watched all 24h"), "{rendered}");
+        assert!(rendered.contains("watched all 1d"), "{rendered}");
     }
 
     /// The self-awareness requirement: a window nobody was watching must not be
