@@ -1,4 +1,4 @@
-//! Phase 5 end to end: watching a job from outside, through real files.
+//! Passive mode end to end: watching a job from outside, through real files.
 //!
 //! The filesystem is real here — a `tempdir`, actual rotations, actual writes —
 //! because the failures this phase is about live in the filesystem's behaviour

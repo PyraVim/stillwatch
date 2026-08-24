@@ -1801,25 +1801,36 @@ name = "nightly-sync"
     }
 
     #[test]
-    fn keys_from_later_phases_are_ignored_rather_than_fatal() {
+    fn unrecognised_keys_are_ignored_rather_than_fatal() {
         let config = load(
             r#"
+mystery = "who knows"
+
 [[job]]
 name = "product-scraper"
   [job.alive]
   expect_every = "60s"
-  [job.freshness]
-  warn_after = "10m"
+
+  [job.onchain]
+  rpc = "https://rpc.example.com"
 
 [[check]]
-name = "vendor-api"
-type = "http"
-url = "https://api.vendor.com/health"
+name    = "vendor-api"
+url     = "https://api.vendor.com/health"
+timeuot = "3s"
 "#,
         );
 
+        // The recognised parts still take effect; the rest is warned about and
+        // dropped rather than refusing to start.
         assert_eq!(config.jobs.len(), 1);
         assert!(config.jobs[0].alive.is_some());
+        assert_eq!(config.checks.len(), 1);
+        assert_eq!(
+            config.checks[0].timeout,
+            Duration::from_secs(5),
+            "the default"
+        );
     }
 
     // -- worked, freshness, ratios ----------------------------------------

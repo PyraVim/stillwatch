@@ -1,4 +1,5 @@
-//! The heartbeat receiver: a single `POST /beat/{job}` route.
+//! The heartbeat receiver: `POST /beat/{job}`, plus a `/health` route so a
+//! second stillwatch can watch this one.
 //!
 //! The wire protocol is the interface. Monitored jobs are written in Python,
 //! TypeScript, Go, Bash and Rust, so the only thing required to integrate is an
@@ -26,10 +27,8 @@ use crate::state::{BeatDetail, SharedState};
 
 /// The optional JSON body of a heartbeat.
 ///
-/// `worked`, `data_ts` and `counters` are accepted and logged but not yet acted
-/// on; liveness is the only signal this version evaluates. They are part of the
-/// documented protocol, so rejecting them would break jobs that already send
-/// them.
+/// Every field is optional, and a job may send any subset of them. Which ones
+/// are actually judged depends on what the job's config declares.
 #[derive(Debug, Deserialize)]
 pub struct Beat {
     /// Whether the job actually did work this time round, as opposed to merely

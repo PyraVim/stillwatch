@@ -1,4 +1,4 @@
-//! Phase 6 end to end: damping, the audit trail, and what `report` admits it
+//! Incidents end to end: damping, the audit trail, and what `report` admits it
 //! did not see.
 //!
 //! The log here is a real file, because the properties being checked are about

@@ -1,4 +1,4 @@
-//! Phase 1 end to end: a config, a stream of beats, and the alerts a person
+//! Liveness end to end: a config, a stream of beats, and the alerts a person
 //! actually receives.
 //!
 //! Time is driven directly. Nothing here sleeps, and the whole scenario — a

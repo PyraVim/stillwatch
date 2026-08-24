@@ -1,4 +1,4 @@
-//! Phase 3 end to end: the `worked` signal, data freshness, and counter ratios.
+//! Work signals end to end: `worked`, data freshness, and counter ratios.
 //!
 //! These three back the failure modes the README leads with — a job that is up
 //! and idle, one acting on frozen data, and one attempting work that never

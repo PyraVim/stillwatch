@@ -1,5 +1,5 @@
-//! Phase 2 end to end: a dependency's latency drifting, and the alerts a person
-//! actually receives.
+//! Degradation end to end: a dependency's latency drifting, and the alerts a
+//! person actually receives.
 //!
 //! Time is driven directly and no probe is ever made. Every scenario here — an
 //! hour of baseline, a slow stretch, a recovery — runs in microseconds.

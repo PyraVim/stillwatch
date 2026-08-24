@@ -1,4 +1,4 @@
-//! Phase 4 end to end: what `learn` writes, and whether it can be trusted.
+//! `learn` end to end: what it writes, and whether it can be trusted.
 //!
 //! The property that matters most here is that the emitted block **loads**.
 //! A learned config is pasted into a file and relied on for months; one that
