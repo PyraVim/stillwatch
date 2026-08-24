@@ -25,6 +25,7 @@ use crate::evaluate::{
     Trigger, WatchedFile,
 };
 use crate::fmt;
+use crate::incidents::WATCHING_INTERVAL;
 
 /// What a notification is about, from the reader's point of view.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -830,6 +831,29 @@ const MAX_OUTBOX: usize = 512;
 /// needs told, not one.
 type IncidentKey = (String, Condition);
 
+/// A stable, greppable name for a condition, for the audit trail.
+///
+/// Deliberately not the `Debug` spelling: this ends up in a file people write
+/// scripts against, and it should not shift because a variant was renamed.
+fn condition_name(condition: &Condition) -> String {
+    match condition {
+        Condition::NoHeartbeat => "no-heartbeat".to_string(),
+        Condition::NoWork => "no-work".to_string(),
+        Condition::Stale => "stale-data".to_string(),
+        Condition::FreshnessUnreported => "freshness-unreported".to_string(),
+        Condition::Ratio(rule) => format!("ratio:{rule}"),
+        Condition::RatioUnreported(rule) => format!("ratio-unreported:{rule}"),
+        Condition::ProcessAbsent => "process-absent".to_string(),
+        Condition::FileStale(what) => format!("{}-stale", what.noun()),
+        Condition::FileMissing(what) => format!("{}-missing", what.noun()),
+        Condition::ArtifactTooSmall => "output-too-small".to_string(),
+        Condition::LoggedError => "logged-error".to_string(),
+        Condition::Down => "down".to_string(),
+        Condition::Degraded => "degraded".to_string(),
+        Condition::UntrustworthyBaseline => "untrustworthy-baseline".to_string(),
+    }
+}
+
 /// An incident that has been reported and has not yet cleared.
 #[derive(Debug)]
 struct Open {
@@ -888,6 +912,12 @@ pub struct Dispatcher {
     open: BTreeMap<IncidentKey, Open>,
     pending: BTreeMap<IncidentKey, Pending>,
 
+    /// The audit trail, when one is configured.
+    log: Option<crate::incidents::Log>,
+
+    /// When it was last recorded that stillwatch is still watching.
+    last_watching: Option<SystemTime>,
+
     /// Rendered but undelivered, oldest first. Order is preserved so that a
     /// recovery can never overtake the alert it resolves.
     outbox: VecDeque<Notification>,
@@ -913,6 +943,8 @@ impl Dispatcher {
             confirm_after,
             open: BTreeMap::new(),
             pending: BTreeMap::new(),
+            log: None,
+            last_watching: None,
             outbox: VecDeque::new(),
             consecutive_failures: 0,
             retry_at: None,
@@ -923,6 +955,42 @@ impl Dispatcher {
     /// Conditions seen but not yet held long enough to report.
     pub fn unconfirmed(&self) -> usize {
         self.pending.len()
+    }
+
+    /// Records every incident to the audit trail as well as sending it.
+    ///
+    /// Written at the same moment the incident is confirmed or resolved, not
+    /// when the message is delivered: the log is a record of what happened, and
+    /// what happened is not contingent on Telegram being reachable.
+    pub fn recording_to(mut self, log: crate::incidents::Log) -> Self {
+        self.log = Some(log);
+        self
+    }
+
+    fn record(&mut self, event: crate::incidents::Event) {
+        if let Some(log) = &mut self.log {
+            log.append(&event);
+        }
+    }
+
+    /// Records that stillwatch is still watching, if enough time has passed.
+    ///
+    /// Called every evaluation cycle; writes at most one record per interval.
+    /// Without these, a log ending in a `started` cannot distinguish a running
+    /// watchdog from one that died silently, and `report` would have to guess.
+    pub fn note_still_watching(&mut self, now: SystemTime) {
+        if self.log.is_none() {
+            return;
+        }
+
+        let due = self
+            .last_watching
+            .is_none_or(|last| now.duration_since(last).unwrap_or_default() >= WATCHING_INTERVAL);
+
+        if due {
+            self.last_watching = Some(now);
+            self.record(crate::incidents::watching(now));
+        }
     }
 
     /// Takes one full evaluation cycle and sends whatever is genuinely new.
@@ -947,6 +1015,7 @@ impl Dispatcher {
     /// Decides what is new. Pure with respect to the network — it only queues.
     fn reconcile(&mut self, assessments: &[Assessment], now: SystemTime) {
         let mut queued = Vec::new();
+        let mut escalations = Vec::new();
 
         let still_wrong: BTreeSet<IncidentKey> = assessments
             .iter()
@@ -978,7 +1047,9 @@ impl Dispatcher {
                     // about whether a condition is real, and this one has
                     // already been established as real.
                     open.severity = assessment.severity;
+                    let opened_at = open.opened_at;
                     queued.push(render(assessment, now));
+                    escalations.push((key, assessment.severity, opened_at));
                 }
                 continue;
             }
@@ -1001,7 +1072,17 @@ impl Dispatcher {
             // Confirmed. The incident is dated from when the condition began,
             // not from now, so its eventual duration covers the whole thing.
             let pending = self.pending.remove(&key).expect("just looked it up");
-            queued.push(render(&pending.latest, now));
+            let notification = render(&pending.latest, now);
+
+            self.record(crate::incidents::opened(
+                &key.0,
+                &condition_name(&key.1),
+                pending.severity,
+                pending.first_seen,
+                &notification.text,
+            ));
+
+            queued.push(notification);
             self.open.insert(
                 key,
                 Open {
@@ -1033,13 +1114,32 @@ impl Dispatcher {
 
         for key in recovered {
             if let Some(open) = self.open.remove(&key) {
-                let lasted = open
-                    .clearing_since
-                    .unwrap_or(now)
+                // The incident ended when the condition stopped, not when the
+                // confirmation window for the recovery finished elapsing.
+                let ended_at = open.clearing_since.unwrap_or(now);
+                let lasted = ended_at
                     .duration_since(open.opened_at)
                     .unwrap_or(Duration::ZERO);
+
+                self.record(crate::incidents::resolved(
+                    &key.0,
+                    &condition_name(&key.1),
+                    open.opened_at,
+                    ended_at,
+                ));
+
                 queued.push(render_recovery(&key.0, &open.headline, lasted));
             }
+        }
+
+        for (key, severity, opened_at) in escalations {
+            self.record(crate::incidents::escalated(
+                &key.0,
+                &condition_name(&key.1),
+                severity,
+                opened_at,
+                now,
+            ));
         }
 
         for notification in queued {

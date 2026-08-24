@@ -32,6 +32,46 @@
 # Where the heartbeat receiver listens. Defaults to 127.0.0.1:9111.
 listen = "127.0.0.1:9111"
 
+# How long a condition must hold before it is reported at all. Something that
+# fixes itself inside this window is not an incident, and never becomes a
+# message. Defaults to 30s; set it to "0s" to report everything immediately.
+#
+# This gates the *first* firing of a condition and nothing else. Once something
+# has been reported and then gets worse, the escalation goes out at once — it is
+# news about something already established as real. Recovery is damped the same
+# way as firing, so a condition that blinks clear and returns does not produce
+# an all-clear followed by a fresh alert.
+confirm_after = "30s"
+
+
+# ---------------------------------------------------------------------------
+# The audit trail
+# ---------------------------------------------------------------------------
+#
+# One JSON object per line, appended, never rewritten. No database — a watchdog
+# that needs its own datastore is a second thing that can fail.
+#
+# If this path cannot be opened at startup, stillwatch refuses to start. A
+# watchdog running happily with no audit trail is a rule that can never fire,
+# pointed at itself.
+#
+# stillwatch also records its own start and stop here, which is what lets
+# `stillwatch report --since 7d` say "I was not watching for these two hours"
+# instead of quietly claiming a hundred percent for a window it slept through.
+#
+# Leave this out entirely and nothing is recorded — startup says so, and
+# `report` will tell you it has no history rather than reporting a quiet week.
+
+[incidents]
+path = "/var/lib/stillwatch/incidents.jsonl"
+
+# Rotates at this size, keeping exactly one previous generation — so the total
+# on disk is bounded at twice this and cannot creep. Retention is by size, not
+# by time: a very busy month can push older incidents out before
+# `report --since 30d` would have reached them. Raise this if you need longer
+# history. Defaults to 8 MiB.
+max_bytes = 8388608
+
 
 # ---------------------------------------------------------------------------
 # Notification

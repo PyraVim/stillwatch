@@ -12,7 +12,7 @@ use stillwatch::config::{self, Config, ConfigError, SystemEnv};
 use stillwatch::evaluate::{check_health, evaluate, unjudged_signals, CheckHealth, UnjudgedSignal};
 use stillwatch::notify::{Dispatcher, DryRun, LogOnly, Notifier, Telegram};
 use stillwatch::state::{SharedState, State};
-use stillwatch::{fmt, learn, passive, prober, receiver};
+use stillwatch::{fmt, incidents, learn, passive, prober, receiver};
 use tokio::time::MissedTickBehavior;
 use tracing_subscriber::EnvFilter;
 
@@ -53,6 +53,13 @@ enum Command {
         #[arg(long = "for", value_name = "DURATION")]
         window: String,
     },
+
+    /// Print uptime, incidents and stillwatch's own coverage from the audit trail
+    Report {
+        /// How far back to look, e.g. 7d
+        #[arg(long, value_name = "DURATION", default_value = "7d")]
+        since: String,
+    },
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -75,6 +82,9 @@ enum StartupError {
         #[source]
         source: humantime::DurationError,
     },
+
+    #[error(transparent)]
+    Incidents(#[from] stillwatch::incidents::IncidentError),
 
     #[error("the receiver stopped unexpectedly")]
     Serve(#[source] io::Error),
@@ -107,8 +117,35 @@ async fn run(cli: Cli) -> Result<(), StartupError> {
                 .map_err(|source| StartupError::Window { source })?;
             learn_mode(config, job, window).await
         }
+        Some(Command::Report { since }) => {
+            let since = humantime::parse_duration(&since)
+                .map_err(|source| StartupError::Window { source })?;
+            report_mode(&config, since)
+        }
         None => watch_mode(config, cli.dry_run).await,
     }
+}
+
+/// Reads the audit trail and says what happened — including how much of the
+/// window stillwatch was actually there for.
+fn report_mode(config: &Config, since: Duration) -> Result<(), StartupError> {
+    let Some(settings) = &config.incidents else {
+        // Not an error: nothing was ever configured to record. But saying
+        // "0 incidents" here would be a lie of exactly the kind this tool is
+        // against.
+        eprintln!(
+            "no [incidents] path is configured, so nothing has ever been recorded.\n\
+             There is no history to report on — this is not the same as a quiet week."
+        );
+        return Ok(());
+    };
+
+    let events = incidents::read_all(&settings.path)?;
+    let until = SystemTime::now();
+    let report = incidents::report(&events, until - since, until);
+
+    print!("{}", incidents::render_report(&report));
+    Ok(())
 }
 
 /// Binds the receiver and starts one prober per check.
@@ -169,10 +206,46 @@ async fn watch_mode(config: Config, dry_run: bool) -> Result<(), StartupError> {
     };
     tracing::info!(channel = notifier.channel(), "notifier ready");
 
+    // Opened before anything else starts, and fatal if it fails. A watchdog
+    // running happily with no audit trail is an inert rule pointed at itself:
+    // everything looks fine, and the record that would prove otherwise was
+    // never written.
+    let mut log = match &config.incidents {
+        Some(settings) => {
+            let log = incidents::Log::open(&settings.path, settings.max_bytes)?;
+            tracing::info!(
+                path = %settings.path.display(),
+                max_bytes = settings.max_bytes,
+                "recording incidents; rotates at that size, keeping one generation"
+            );
+            Some(log)
+        }
+        None => {
+            tracing::warn!(
+                "no [incidents] path configured; nothing is being recorded and \
+                 `stillwatch report` will have no history to read"
+            );
+            None
+        }
+    };
+
+    if let Some(log) = &mut log {
+        log.append(&incidents::started(SystemTime::now()));
+    }
+
     let state = SharedState::new(State::new(SystemTime::now(), &config.jobs, &config.checks));
     let (listener, probers) = observe(&config, &state).await?;
 
-    let evaluator = tokio::spawn(watch(state.clone(), Dispatcher::new(notifier)));
+    let mut dispatcher = Dispatcher::with_confirmation(notifier, config.confirm_after);
+    if let Some(log) = log {
+        dispatcher = dispatcher.recording_to(log);
+    }
+    tracing::info!(
+        confirm_after = %fmt::duration(config.confirm_after),
+        "a condition must hold this long before it is reported"
+    );
+
+    let evaluator = tokio::spawn(watch(state.clone(), dispatcher));
 
     let served = axum::serve(listener, receiver::router(state))
         .with_graceful_shutdown(shutdown())
@@ -182,6 +255,20 @@ async fn watch_mode(config: Config, dry_run: bool) -> Result<(), StartupError> {
     for prober in probers {
         prober.abort();
     }
+
+    // The `stopped` record is what tells a later `report` that the gap after
+    // this moment was a deliberate absence rather than an unexplained one.
+    if let Some(settings) = &config.incidents {
+        match incidents::Log::open(&settings.path, settings.max_bytes) {
+            Ok(mut log) => log.append(&incidents::stopped(SystemTime::now())),
+            Err(err) => tracing::error!(
+                %err,
+                "could not record the shutdown; report will treat this as an \
+                 unexplained gap"
+            ),
+        }
+    }
+
     served.map_err(StartupError::Serve)
 }
 
@@ -270,6 +357,7 @@ async fn watch(state: SharedState, mut dispatcher: Dispatcher) {
             )
         });
 
+        dispatcher.note_still_watching(now);
         report_check_health(&mut reported, health);
         report_unjudged(&mut reported_unjudged, unjudged);
         dispatcher.dispatch(&assessments, now).await;

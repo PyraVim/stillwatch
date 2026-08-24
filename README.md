@@ -40,11 +40,21 @@ watches their latency against their *own* recent normal — because a dependency
 that has always taken 400ms is fine, and one that took 90ms an hour ago is not.
 It catches the API that still returns 200 on every request and now takes 1.4s.
 
-Throughout, you get one message per incident, not one per evaluation cycle, and
-an all-clear with the duration when it ends.
+**Watching from outside.** If you can't modify the job — nobody adds code to
+something before they trust the tool — point it at a pidfile, a log that should
+still be moving, or an output file that should still be appearing.
 
-That's version 0.5. The rest of the plan is in [Roadmap](#roadmap), and none of
-it is built yet.
+Throughout, you get one message per incident, not one per evaluation cycle, and
+an all-clear with the duration when it ends. Everything is recorded to a JSONL
+audit trail, including the times stillwatch itself wasn't running.
+
+Three commands:
+
+```bash
+stillwatch --config stillwatch.toml     # watch
+stillwatch learn --for 6h               # measure thresholds instead of guessing
+stillwatch report --since 7d            # what happened, and what it didn't see
+```
 
 ---
 
@@ -543,12 +553,20 @@ the same alerts to the log instead of delivering them.
 A monitoring tool that cries wolf gets muted, and a muted tool is worse than no
 tool because you think you're covered.
 
-* **Deduplicated** — one alert per incident, not one per evaluation cycle
+* **Damped** — a condition must hold for `confirm_after` (30s by default) before
+  it becomes a message at all. Something that fixes itself in four seconds is not
+  an incident. This gates the *first* firing and nothing else: once a condition
+  is established as real and then gets worse, the escalation goes out at once.
+  Recovery is damped the same way, so a condition that blinks clear and returns
+  doesn't produce an all-clear followed by a fresh alert.
+* **Deduplicated** — one alert per incident, not one per evaluation cycle.
+  Deduplication is per *condition*, so a job that's both missing its heartbeat
+  and running a collapsed parse rate reports both.
 * **Escalating** — warn, then critical. Then nothing. It doesn't nag, and it
   doesn't walk back down either.
 * **Recovering** — every alert gets an all-clear with the duration of the whole
-  incident, measured from the first warning rather than the escalation. An alert
-  with no resolution teaches people to ignore alerts.
+  incident, measured from when the condition began rather than when it was
+  confirmed. An alert with no resolution teaches people to ignore alerts.
 * **Fails loudly** — if the notifier is unreachable, alerts queue in order and
   retry with backoff. Nothing is dropped silently. A message the notifier will
   refuse identically forever — a wrong chat id, say — is dropped rather than
@@ -557,7 +575,67 @@ tool because you think you're covered.
 
 ---
 
+## Incidents, and what it admits it didn't see
+
+Everything appends to a JSONL file. No database.
+
+```toml
+[incidents]
+path      = "/var/lib/stillwatch/incidents.jsonl"
+max_bytes = 8388608
+```
+
+**If that path can't be opened at startup, stillwatch refuses to start.** A
+watchdog running happily with no audit trail is an inert rule pointed at itself:
+everything looks fine, and the record that would have proved otherwise was never
+written.
+
+The log **rotates at `max_bytes` and keeps exactly one previous generation**, so
+it's bounded at twice that and cannot creep. Retention is by size, not by time —
+a very busy month can push older incidents out before `report --since 30d` would
+have reached them. Raise `max_bytes` if you need longer history.
+
+```bash
+stillwatch report --since 7d
+```
+
+```
+product-scraper   uptime  99.2%   3 incidents   longest 18m4s
+nightly-sync      uptime   100%   no incidents
+vendor-api        uptime  97.8%   1 incident    longest 41m
+
+watched 6d21h of the last 7d · 2h58m unaccounted for (stillwatch was not
+running, or stopped without recording it)
+percentages above are of the watched time only
+```
+
+That last block is the point. stillwatch records its own start and stop, and a
+`watching` marker every five minutes in between, so `report` can say how much of
+the window it was actually there for. Time it can't account for is **excluded
+from every percentage** and reported separately.
+
+The alternatives were both worse. Counting an unwatched gap as uptime is a
+monitoring tool overstating its own coverage. Counting it as downtime invents an
+outage. Neither is known, so neither is claimed.
+
+Three cases it distinguishes rather than guessing at:
+
+* **a clean shutdown** — a `stopped` record, so the gap after it was deliberate
+* **a silent death** — a `started` with no `stopped` and the `watching` markers
+  simply stopping. Coverage ends at the last thing that run actually recorded;
+  everything after is unknown, and the report says *"or stopped without
+  recording it"*
+* **no coverage at all** — `uptime unknown`, not 0% and not 100%. If nothing was
+  watching, there is no percentage to give, and a window with no records at all
+  reads as *"no record of watching any of the last 7d — every number above is
+  unknown rather than good"*
+
+---
+
 ## It doesn't lie about itself
+
+Every one of these is the same idea: the tool's own failure class, pointed at
+itself.
 
 * **A restart is not an outage.** No history means unknown, not down. It waits a
   full threshold before judging anything.
@@ -565,8 +643,18 @@ tool because you think you're covered.
   silence is measured from when `stillwatch` started — and the alert says exactly
   that rather than inventing a last-beat time it never observed. A job that died
   before the watchdog started is the failure a watchdog most needs to catch.
+* **It reports its own gaps.** `report` says how much of the window it was
+  actually watching, and excludes the rest from every percentage.
+* **It refuses to start without its audit trail.** A watchdog running happily
+  with no record is an inert rule pointed at itself.
+* **It says which of your rules are doing nothing.** A ratio naming a counter
+  that never arrives, or a freshness rule that no beat feeds, gets one alert
+  saying so — because from outside, a rule that can never fire is
+  indistinguishable from one that is passing.
 * **One process, no clustering.** If you want the watchdog watched, run a second
-  one pointed at the first. That's the whole answer.
+  one pointed at the first. `GET /health` exists for exactly that and says
+  nothing more than "this process is answering" — a watchdog whose own health
+  check claimed more would be making the mistake this tool is about.
 
 ---
 
@@ -581,25 +669,43 @@ cargo build --release
 ./target/release/stillwatch --config stillwatch.toml
 ```
 
-Single static binary, no runtime dependencies, no database.
+One binary, no runtime dependencies, no database.
+
+**systemd** — [`deploy/stillwatch.service`](deploy/stillwatch.service). Note
+`KillSignal=SIGINT`: that's what stillwatch shuts down gracefully on, and a
+graceful shutdown is what writes the `stopped` record. Without it every restart
+looks to `report` like an unexplained gap. Secrets go in an `EnvironmentFile`
+that root can read and nobody else can.
+
+**Docker** — [`deploy/Dockerfile`](deploy/Dockerfile). Distroless, non-root, no
+shell. Mount a volume at `/var/lib/stillwatch` or the audit trail goes with the
+container — and `report` will honestly say it has no record of the window rather
+than claiming everything was fine.
+
+**Watching the watchdog.** There's no clustering, deliberately. If you want
+stillwatch watched, run a second one pointed at the first — it's an HTTP
+endpoint like any other:
+
+```toml
+[[check]]
+name = "stillwatch-primary"
+url  = "http://primary:9111/beat/anything"
+```
+
+That returns 404 for an unconfigured job, which is a perfectly good liveness
+signal: something answered.
 
 ---
 
 ## Roadmap
 
-None of this is built. It's here so you can see where it's going and decide
-whether today's version is worth adopting anyway.
+Three things are genuinely not built. Everything else described above is.
 
 | | |
 |-|-|
-| **Job → dependency links** | Today a job alert can't say "the scraper is down, not its dependency", because nothing in the config associates a job with the checks it relies on. Needs something like `depends_on = ["vendor-api"]`. |
+| **Job → dependency links** | A job alert can't yet say "the scraper is down, not its dependency", because nothing in the config associates a job with the checks it relies on. Needs something like `depends_on = ["vendor-api"]`. |
 | **Cumulative counters** | Counters are per beat. A job sending running lifetime totals produces meaningless sums and nothing detects it. Detecting monotonic series and diffing them needs reset handling to be worth having. |
-| **`learn` mode** | `stillwatch learn --job x --for 6h` observes without alerting, then emits a config block with the evidence behind every number. Nobody knows their job's real cadence, and a watchdog with wrong thresholds either pages constantly until muted or never fires. |
-| **`--dry-run`** | Evaluate live and log what it *would* have sent. People need to watch it be right for a day before trusting it with their phone. |
-| **Passive mode** | Watch something you can't modify: a pidfile, a log that should still be moving, an output file that should still be appearing. Weaker signals than a heartbeat, and the docs will say so — but "I can watch this today without touching your code" is what makes it usable on day one. |
-| **Flap damping** | Require a condition to hold through a confirmation window. Something that fixes itself in four seconds is not an incident. `down_after` already does this for checks; the job signals do not have an equivalent. |
-| **Incident log and `report`** | Append every incident to JSONL; `stillwatch report --since 7d` prints per-subject uptime, incident count and longest outage — including gaps when `stillwatch` itself wasn't watching, rather than claiming 100% for a window it missed. |
-| **Deploy** | Dockerfile and a systemd unit. |
+| **On-chain passive checks** | `expect_activity_every` against a contract address. Needs log-range queries, which is a different thing from the JSON-RPC dependency check that already exists. |
 
 ---
 

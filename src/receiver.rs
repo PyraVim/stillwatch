@@ -18,7 +18,7 @@ use axum::body::Bytes;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use axum::routing::post;
+use axum::routing::{get, post};
 use axum::Router;
 use serde::Deserialize;
 
@@ -86,7 +86,23 @@ impl Beat {
 pub fn router(state: SharedState) -> Router {
     Router::new()
         .route("/beat/{job}", post(beat))
+        .route("/health", get(health))
         .with_state(state)
+}
+
+/// Says only that this process is answering.
+///
+/// Deliberately nothing more. The spec's answer to "who watches the watchdog"
+/// is to run a second stillwatch pointed at the first, and that needs something
+/// to point at — `POST /beat/{job}` answers 404 for an unconfigured name, which
+/// a probe would read as an outage. This exists so that documented arrangement
+/// actually works.
+///
+/// It does not claim the jobs are healthy, or that anything is being evaluated.
+/// A watchdog whose own health check asserted more than "the process is up"
+/// would be making the mistake this whole tool is about.
+async fn health() -> Response {
+    (StatusCode::OK, "watching\n").into_response()
 }
 
 async fn beat(State(state): State<SharedState>, Path(job): Path<String>, body: Bytes) -> Response {

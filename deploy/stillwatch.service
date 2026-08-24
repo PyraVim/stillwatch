@@ -1,0 +1,59 @@
+[Unit]
+Description=stillwatch — a watchdog for processes that run unattended
+Documentation=https://github.com/PyraVim/stillwatch
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=exec
+ExecStart=/usr/local/bin/stillwatch --config /etc/stillwatch/stillwatch.toml
+
+# Secrets belong in a file root can read and nobody else can, referenced from
+# the config as ${TELEGRAM_TOKEN} and ${TELEGRAM_CHAT}. An unset variable is a
+# startup error naming it, so a missing file fails loudly rather than running
+# with no notifier.
+EnvironmentFile=-/etc/stillwatch/stillwatch.env
+
+User=stillwatch
+Group=stillwatch
+
+# The incident log lives here; systemd creates it with the right owner.
+# Without a durable path, `report` has no history — and will say so rather than
+# claiming a quiet week.
+StateDirectory=stillwatch
+WorkingDirectory=/var/lib/stillwatch
+
+# SIGINT is what stillwatch shuts down gracefully on, and a graceful shutdown is
+# what writes the `stopped` record. Without it every restart looks to `report`
+# like an unexplained gap.
+KillSignal=SIGINT
+TimeoutStopSec=20
+
+Restart=always
+RestartSec=5
+
+# A watchdog that dies with its host is no use, so it starts early and stays.
+# These are the ordinary hardening options; none of them prevent stillwatch
+# reading a pidfile, log or artifact under ReadPaths below.
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+
+# Passive mode reads files belonging to the jobs being watched. List them here;
+# ProtectSystem=strict makes everything else read-only anyway, but being
+# explicit means a wrong path fails visibly rather than silently reading
+# nothing.
+# ReadOnlyPaths=/var/run/etl.pid /var/log/etl.log /data/exports
+
+[Install]
+WantedBy=multi-user.target

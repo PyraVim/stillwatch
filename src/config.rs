@@ -58,6 +58,19 @@ const DEFAULT_MIN_SAMPLE: u64 = 30;
 /// How long a watched process may be absent before that is reported.
 const DEFAULT_ABSENT_AFTER: Duration = Duration::from_secs(60);
 
+/// How long a condition must hold before it is reported, when not configured.
+///
+/// Something that fixes itself inside this is not an incident. Set it to zero
+/// to report everything the moment it is seen.
+const DEFAULT_CONFIRM_AFTER: Duration = Duration::from_secs(30);
+
+/// The incident log rotates at this size when not configured, keeping one
+/// generation — so about sixteen megabytes on disk in total.
+const DEFAULT_INCIDENT_MAX_BYTES: u64 = 8 * 1024 * 1024;
+
+/// Below this a rotation would throw away history faster than it is written.
+const MIN_INCIDENT_MAX_BYTES: u64 = 4 * 1024;
+
 /// Scalar config paths that a `STILLWATCH_*` environment variable may override.
 ///
 /// The mapping is: uppercase the dotted path and replace `.` with `_`. We
@@ -153,6 +166,9 @@ pub enum ConfigError {
     #[error("check {check:?}: {message}")]
     InvalidCheck { check: String, message: String },
 
+    #[error("{message}")]
+    InvalidIncidents { message: String },
+
     #[error("job {job:?}: log.error_regex {pattern:?} is not a valid regular expression")]
     InvalidRegex {
         job: String,
@@ -173,6 +189,22 @@ pub struct Config {
     pub telegram: Option<TelegramConfig>,
     pub jobs: Vec<JobConfig>,
     pub checks: Vec<CheckConfig>,
+
+    /// How long a condition must hold before it is reported at all.
+    pub confirm_after: Duration,
+
+    /// Where the audit trail goes. `None` means nothing is recorded, which
+    /// startup says out loud.
+    pub incidents: Option<IncidentConfig>,
+}
+
+#[derive(Debug, Clone)]
+pub struct IncidentConfig {
+    pub path: PathBuf,
+
+    /// The log rotates at this size and exactly one generation is kept, so the
+    /// total on disk is bounded at twice this and cannot creep.
+    pub max_bytes: u64,
 }
 
 #[derive(Clone)]
@@ -559,7 +591,10 @@ fn set_path(value: &mut Value, path: &str, new: Value) {
 fn warn_unrecognized(root: &toml::Table) {
     for (key, value) in root {
         match key.as_str() {
-            "listen" => {}
+            "listen" | "confirm_after" => {}
+            "incidents" => {
+                warn_children(value, "incidents", &["path", "max_bytes"], |_| {});
+            }
             "notify" => warn_children(value, "notify", &["telegram"], |v| {
                 warn_children(v, "notify.telegram", &["token", "chat_id"], |_| {})
             }),
@@ -702,11 +737,20 @@ fn unrecognized(path: &str) {
 #[derive(Deserialize)]
 struct RawConfig {
     listen: Option<String>,
+    #[serde(default, with = "humantime_serde")]
+    confirm_after: Option<Duration>,
     notify: Option<RawNotify>,
+    incidents: Option<RawIncidents>,
     #[serde(default, rename = "job")]
     jobs: Vec<RawJob>,
     #[serde(default, rename = "check")]
     checks: Vec<RawCheck>,
+}
+
+#[derive(Deserialize)]
+struct RawIncidents {
+    path: PathBuf,
+    max_bytes: Option<u64>,
 }
 
 #[derive(Deserialize)]
@@ -876,11 +920,37 @@ impl RawConfig {
             checks.push(check);
         }
 
+        let incidents = self
+            .incidents
+            .map(|raw| {
+                if raw.path.as_os_str().is_empty() {
+                    return Err(ConfigError::InvalidIncidents {
+                        message: "incidents.path must be a path".to_string(),
+                    });
+                }
+                let max_bytes = raw.max_bytes.unwrap_or(DEFAULT_INCIDENT_MAX_BYTES);
+                if max_bytes < MIN_INCIDENT_MAX_BYTES {
+                    return Err(ConfigError::InvalidIncidents {
+                        message: format!(
+                            "incidents.max_bytes ({max_bytes}) is too small to hold even a \
+                             handful of records; {MIN_INCIDENT_MAX_BYTES} is the minimum"
+                        ),
+                    });
+                }
+                Ok(IncidentConfig {
+                    path: raw.path,
+                    max_bytes,
+                })
+            })
+            .transpose()?;
+
         Ok(Config {
             listen,
             telegram,
             jobs,
             checks,
+            confirm_after: self.confirm_after.unwrap_or(DEFAULT_CONFIRM_AFTER),
+            incidents,
         })
     }
 }

@@ -21,6 +21,12 @@ use serde::{Deserialize, Serialize};
 use crate::evaluate::Severity;
 use crate::notify::Notification;
 
+/// How often stillwatch records that it is still watching.
+///
+/// Short enough that a crash is noticed within one interval, cheap enough to
+/// ignore: about eleven kilobytes a day against a default eight megabyte cap.
+pub const WATCHING_INTERVAL: Duration = Duration::from_secs(300);
+
 /// What a single line in the log says happened.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "event", rename_all = "snake_case")]
@@ -35,12 +41,36 @@ pub enum Event {
     /// what happened in between.
     Stopped { ts: i64 },
 
+    /// stillwatch was still watching at this moment.
+    ///
+    /// Written periodically for one reason: without it, a log ending in a
+    /// `started` is ambiguous between "still running" and "died silently", and
+    /// the only way to resolve it would be to assume. Assuming it is still
+    /// running claims coverage for time nobody watched — which is exactly the
+    /// overstatement this file exists to prevent.
+    Watching { ts: i64 },
+
     Opened {
         ts: i64,
         subject: String,
         condition: String,
         severity: String,
         reason: String,
+    },
+
+    /// An open incident got worse.
+    ///
+    /// Recorded separately rather than by rewriting the `opened` line, because
+    /// this file is append-only. Without it an incident that opened as a
+    /// warning and became critical would be filed forever as a warning, which
+    /// is the sort of quiet inaccuracy an audit trail exists to prevent.
+    /// `report` does not count these as separate incidents.
+    Escalated {
+        ts: i64,
+        subject: String,
+        condition: String,
+        severity: String,
+        opened_ts: i64,
     },
 
     Resolved {
@@ -58,7 +88,9 @@ impl Event {
         match self {
             Event::Started { ts, .. }
             | Event::Stopped { ts }
+            | Event::Watching { ts }
             | Event::Opened { ts, .. }
+            | Event::Escalated { ts, .. }
             | Event::Resolved { ts, .. } => *ts,
         }
     }
@@ -210,10 +242,7 @@ pub fn opened(
         ts: unix(at),
         subject: subject.to_string(),
         condition: condition.to_string(),
-        severity: match severity {
-            Severity::Warn => "warn".to_string(),
-            Severity::Critical => "critical".to_string(),
-        },
+        severity: severity_name(severity),
         reason: first_line(reason),
     }
 }
@@ -237,6 +266,33 @@ pub fn started(at: SystemTime) -> Event {
 
 pub fn stopped(at: SystemTime) -> Event {
     Event::Stopped { ts: unix(at) }
+}
+
+pub fn escalated(
+    subject: &str,
+    condition: &str,
+    severity: Severity,
+    opened_at: SystemTime,
+    at: SystemTime,
+) -> Event {
+    Event::Escalated {
+        ts: unix(at),
+        subject: subject.to_string(),
+        condition: condition.to_string(),
+        severity: severity_name(severity),
+        opened_ts: unix(opened_at),
+    }
+}
+
+pub fn watching(at: SystemTime) -> Event {
+    Event::Watching { ts: unix(at) }
+}
+
+fn severity_name(severity: Severity) -> String {
+    match severity {
+        Severity::Warn => "warn".to_string(),
+        Severity::Critical => "critical".to_string(),
+    }
 }
 
 /// The alert's headline, which is what a person reading the log wants.
@@ -407,12 +463,27 @@ fn coverage(events: &[Event], until: SystemTime) -> Vec<Coverage> {
     }
 
     if let Some(from) = open {
-        // Still running: covered right up to now.
-        spans.push(Coverage {
-            from,
-            to: until.max(from),
-            clean: true,
-        });
+        // A log that ends in a `started` means one of two things and cannot say
+        // which: still running, or gone without a word. The `watching` records
+        // settle it. If one is not yet due, the run is live and covered to now;
+        // if one was due and never came, coverage ends at the last thing it
+        // actually said and the rest belongs to nobody.
+        let last = last_seen.unwrap_or(from).max(from);
+        let silent_for = until.duration_since(last).unwrap_or(Duration::ZERO);
+
+        if silent_for <= WATCHING_INTERVAL {
+            spans.push(Coverage {
+                from,
+                to: until.max(from),
+                clean: true,
+            });
+        } else {
+            spans.push(Coverage {
+                from,
+                to: last,
+                clean: false,
+            });
+        }
     }
 
     spans
@@ -894,6 +965,47 @@ mod tests {
             rendered.contains("stopped without recording it"),
             "an unclean shutdown must be named as a possibility: {rendered}"
         );
+    }
+
+    /// Regression, found by running it: a log ending in a `started` was assumed
+    /// to mean "still running", so `report` claimed coverage for the time after
+    /// the process had already died. The periodic `watching` records settle it.
+    #[test]
+    fn a_run_that_went_silent_stops_counting_as_covered() {
+        let events = vec![
+            started(at(0)),
+            watching(at(300)),
+            watching(at(600)),
+            // Then nothing. It died somewhere after 600.
+        ];
+
+        let report = report(&events, at(0), at(DAY));
+
+        assert_eq!(
+            report.watched,
+            Duration::from_secs(600),
+            "coverage ends at the last thing it actually said"
+        );
+        assert_eq!(report.unclean_shutdowns, 1);
+
+        let rendered = render_report(&report);
+        assert!(
+            rendered.contains("stopped without recording it"),
+            "a silent death must be named as a possibility: {rendered}"
+        );
+    }
+
+    /// ...but a daemon that is simply running right now must not show a
+    /// spurious gap at the end of every report.
+    #[test]
+    fn a_run_that_is_still_going_is_covered_to_now() {
+        let events = vec![started(at(0)), watching(at(DAY - 60))];
+
+        let report = report(&events, at(0), at(DAY));
+
+        assert_eq!(report.watched, Duration::from_secs(DAY));
+        assert_eq!(report.unknown, Duration::ZERO);
+        assert_eq!(report.unclean_shutdowns, 0);
     }
 
     /// Neither 0% nor 100%. Nothing was watching, so there is no answer.
