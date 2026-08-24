@@ -127,7 +127,7 @@ async fn simulate(
 ) {
     let mut now = from;
     while now <= to {
-        if now % every == 0 {
+        if now.is_multiple_of(every) {
             if let Some(detail) = detail(now) {
                 state.record_beat_with(job, at(now), &detail);
             }

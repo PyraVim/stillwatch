@@ -112,7 +112,7 @@ async fn simulate(
 ) {
     let mut now = from;
     while now <= to {
-        if now % INTERVAL == 0 {
+        if now.is_multiple_of(INTERVAL) {
             for (check, outcome) in probes {
                 state.record_probe(
                     check,
