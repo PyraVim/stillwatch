@@ -837,11 +837,35 @@ struct Open {
     /// has been told it is critical, dropping back to warn is not news.
     severity: Severity,
 
-    /// When the incident started — the *first* alert, not the escalation, so
-    /// the all-clear reports the whole outage.
+    /// When the condition actually began — not when it was confirmed — so the
+    /// all-clear reports the whole outage rather than the part of it that
+    /// happened after the confirmation window elapsed.
     opened_at: SystemTime,
 
     headline: String,
+
+    /// When the condition stopped being reported. `None` while it persists.
+    ///
+    /// Recovery is damped as well as firing. Something that clears for four
+    /// seconds and comes back has not recovered, and an all-clear followed by a
+    /// fresh alert is flapping in the other direction.
+    clearing_since: Option<SystemTime>,
+}
+
+/// A condition seen but not yet confirmed.
+///
+/// The confirmation window gates the *first* firing of a condition and nothing
+/// else. Once a condition is real and has been reported, an escalation is news
+/// about something already established, so it goes out immediately — damping it
+/// would add latency to the worse half of the story for no benefit.
+#[derive(Debug)]
+struct Pending {
+    severity: Severity,
+    first_seen: SystemTime,
+
+    /// The most recent assessment, so that when it does fire the alert
+    /// describes the condition now rather than when the window opened.
+    latest: Assessment,
 }
 
 /// Turns a stream of per-cycle assessments into the alerts a person actually
@@ -857,7 +881,12 @@ struct Open {
 ///   with backoff
 pub struct Dispatcher {
     notifier: Arc<dyn Notifier>,
+
+    /// How long a condition must hold before it is reported at all.
+    confirm_after: Duration,
+
     open: BTreeMap<IncidentKey, Open>,
+    pending: BTreeMap<IncidentKey, Pending>,
 
     /// Rendered but undelivered, oldest first. Order is preserved so that a
     /// recovery can never overtake the alert it resolves.
@@ -869,15 +898,31 @@ pub struct Dispatcher {
 }
 
 impl Dispatcher {
+    /// A dispatcher that reports a condition the moment it is seen.
     pub fn new(notifier: Arc<dyn Notifier>) -> Self {
+        Self::with_confirmation(notifier, Duration::ZERO)
+    }
+
+    /// A dispatcher that waits for a condition to hold before reporting it.
+    ///
+    /// The daemon always uses this one; the undamped constructor exists for
+    /// tests that are about something else.
+    pub fn with_confirmation(notifier: Arc<dyn Notifier>, confirm_after: Duration) -> Self {
         Self {
             notifier,
+            confirm_after,
             open: BTreeMap::new(),
+            pending: BTreeMap::new(),
             outbox: VecDeque::new(),
             consecutive_failures: 0,
             retry_at: None,
             dropped: 0,
         }
+    }
+
+    /// Conditions seen but not yet held long enough to report.
+    pub fn unconfirmed(&self) -> usize {
+        self.pending.len()
     }
 
     /// Takes one full evaluation cycle and sends whatever is genuinely new.
@@ -920,47 +965,80 @@ impl Dispatcher {
             .map(|a| a.subject.as_str())
             .collect();
 
-        let recovered: Vec<IncidentKey> = self
-            .open
-            .keys()
-            .filter(|key| !still_wrong.contains(*key))
-            .filter(|(subject, _)| !unjudgeable.contains(subject.as_str()))
-            .cloned()
-            .collect();
-
-        for key in recovered {
-            if let Some(open) = self.open.remove(&key) {
-                let lasted = now.duration_since(open.opened_at).unwrap_or(Duration::ZERO);
-                queued.push(render_recovery(&key.0, &open.headline, lasted));
-            }
-        }
-
+        // -- conditions currently being reported ---------------------------
         for assessment in assessments {
             let key = (assessment.subject.clone(), assessment.reason.condition());
 
-            match self.open.get_mut(&key) {
-                // Already reported at this severity or worse. Saying it again
-                // every cycle is how alerting gets muted.
-                Some(open) if assessment.severity <= open.severity => {}
+            if let Some(open) = self.open.get_mut(&key) {
+                // Still here, so any recovery timer that had started is void.
+                open.clearing_since = None;
 
-                // Escalation: warn became critical. Worth one more message,
-                // and the incident keeps its original start time.
-                Some(open) => {
+                if assessment.severity > open.severity {
+                    // Escalation goes out at once. The confirmation window is
+                    // about whether a condition is real, and this one has
+                    // already been established as real.
                     open.severity = assessment.severity;
                     queued.push(render(assessment, now));
                 }
+                continue;
+            }
 
-                None => {
-                    self.open.insert(
-                        key,
-                        Open {
-                            severity: assessment.severity,
-                            opened_at: now,
-                            headline: assessment.reason.headline(),
-                        },
-                    );
-                    queued.push(render(assessment, now));
-                }
+            let pending = self.pending.entry(key.clone()).or_insert_with(|| Pending {
+                severity: assessment.severity,
+                first_seen: now,
+                latest: assessment.clone(),
+            });
+            pending.severity = pending.severity.max(assessment.severity);
+            pending.latest = assessment.clone();
+
+            let held_for = now
+                .duration_since(pending.first_seen)
+                .unwrap_or(Duration::ZERO);
+            if held_for < self.confirm_after {
+                continue;
+            }
+
+            // Confirmed. The incident is dated from when the condition began,
+            // not from now, so its eventual duration covers the whole thing.
+            let pending = self.pending.remove(&key).expect("just looked it up");
+            queued.push(render(&pending.latest, now));
+            self.open.insert(
+                key,
+                Open {
+                    severity: pending.severity,
+                    opened_at: pending.first_seen,
+                    headline: pending.latest.reason.headline(),
+                    clearing_since: None,
+                },
+            );
+        }
+
+        // Something that went away before it was ever confirmed is exactly what
+        // the window is for. Nothing was sent, so nothing needs retracting.
+        self.pending.retain(|key, _| still_wrong.contains(key));
+
+        // -- conditions that have stopped being reported --------------------
+        let mut recovered = Vec::new();
+        for (key, open) in self.open.iter_mut() {
+            if still_wrong.contains(key) || unjudgeable.contains(key.0.as_str()) {
+                continue;
+            }
+
+            let clearing_since = *open.clearing_since.get_or_insert(now);
+            let clear_for = now.duration_since(clearing_since).unwrap_or(Duration::ZERO);
+            if clear_for >= self.confirm_after {
+                recovered.push(key.clone());
+            }
+        }
+
+        for key in recovered {
+            if let Some(open) = self.open.remove(&key) {
+                let lasted = open
+                    .clearing_since
+                    .unwrap_or(now)
+                    .duration_since(open.opened_at)
+                    .unwrap_or(Duration::ZERO);
+                queued.push(render_recovery(&key.0, &open.headline, lasted));
             }
         }
 
@@ -1927,6 +2005,202 @@ mod tests {
             ]
         );
         assert_eq!(dispatcher.open_incidents(), 0);
+    }
+
+    // -- flap damping ------------------------------------------------------
+
+    const CONFIRM: Duration = Duration::from_secs(30);
+
+    fn damped(fake: Arc<Fake>) -> Dispatcher {
+        Dispatcher::with_confirmation(fake, CONFIRM)
+    }
+
+    /// Something that fixes itself in four seconds is not an incident.
+    #[tokio::test]
+    async fn a_condition_that_clears_inside_the_window_is_never_reported() {
+        let fake = Fake::shared();
+        let mut dispatcher = damped(fake.clone());
+        let warn = [silent("product-scraper", Severity::Warn, 312)];
+
+        dispatcher.dispatch(&warn, at(2_000)).await;
+        dispatcher.dispatch(&warn, at(2_004)).await;
+        assert_eq!(dispatcher.unconfirmed(), 1);
+        assert!(fake.delivered().is_empty());
+
+        // Gone before it was ever confirmed.
+        dispatcher.dispatch(&[], at(2_008)).await;
+
+        assert!(
+            fake.delivered().is_empty(),
+            "nothing was sent, so there is nothing to retract"
+        );
+        assert_eq!(dispatcher.unconfirmed(), 0);
+        assert_eq!(dispatcher.open_incidents(), 0);
+    }
+
+    /// A genuine outage must not be damped into invisibility — only delayed by
+    /// the window, and then dated from when it actually began.
+    #[tokio::test]
+    async fn a_condition_that_holds_is_reported_and_dated_from_when_it_began() {
+        let fake = Fake::shared();
+        let mut dispatcher = damped(fake.clone());
+        let warn = [silent("product-scraper", Severity::Warn, 312)];
+
+        for tick in 0..6 {
+            dispatcher.dispatch(&warn, at(2_000 + tick * 5)).await;
+        }
+        assert!(fake.delivered().is_empty(), "still inside the window");
+
+        dispatcher.dispatch(&warn, at(2_030)).await;
+        assert_eq!(fake.levels(), [Level::Warn], "confirmed and reported");
+
+        // The incident is dated from 2_000, not from when it was confirmed.
+        dispatcher.dispatch(&[], at(2_100)).await;
+        dispatcher.dispatch(&[], at(2_130)).await;
+
+        let recovery = fake.delivered().pop().expect("a recovery");
+        assert_eq!(
+            recovery.text, "✅  product-scraper recovered — no heartbeat for 1m40s",
+            "the duration must cover the confirmation window too"
+        );
+    }
+
+    /// The window gates the first firing of a condition, not escalation. Once
+    /// something is established as real, worse news goes out at once.
+    #[tokio::test]
+    async fn escalation_is_immediate_once_a_condition_has_been_confirmed() {
+        let fake = Fake::shared();
+        let mut dispatcher = damped(fake.clone());
+
+        for tick in 0..8 {
+            dispatcher
+                .dispatch(
+                    &[silent("product-scraper", Severity::Warn, 312)],
+                    at(2_000 + tick * 5),
+                )
+                .await;
+        }
+        assert_eq!(fake.levels(), [Level::Warn]);
+
+        // It gets worse on the very next cycle.
+        dispatcher
+            .dispatch(
+                &[silent("product-scraper", Severity::Critical, 950)],
+                at(2_045),
+            )
+            .await;
+
+        assert_eq!(
+            fake.levels(),
+            [Level::Warn, Level::Critical],
+            "a confirmed condition getting worse must not wait out another window"
+        );
+    }
+
+    /// Recovery is damped too. Clearing for four seconds and coming back is not
+    /// a recovery, and an all-clear followed by a fresh alert is flapping in the
+    /// other direction.
+    #[tokio::test]
+    async fn a_condition_that_blinks_clear_and_returns_sends_no_all_clear() {
+        let fake = Fake::shared();
+        let mut dispatcher = damped(fake.clone());
+        let warn = [silent("product-scraper", Severity::Warn, 312)];
+
+        for tick in 0..8 {
+            dispatcher.dispatch(&warn, at(2_000 + tick * 5)).await;
+        }
+        assert_eq!(fake.levels(), [Level::Warn]);
+
+        // Clear for one cycle, then back.
+        dispatcher.dispatch(&[], at(2_045)).await;
+        dispatcher.dispatch(&warn, at(2_050)).await;
+        dispatcher.dispatch(&warn, at(2_100)).await;
+
+        assert_eq!(
+            fake.levels(),
+            [Level::Warn],
+            "it never really recovered, so nothing more should have been said"
+        );
+        assert_eq!(dispatcher.open_incidents(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_condition_that_stays_clear_recovers_after_the_window() {
+        let fake = Fake::shared();
+        let mut dispatcher = damped(fake.clone());
+        let warn = [silent("product-scraper", Severity::Warn, 312)];
+
+        for tick in 0..8 {
+            dispatcher.dispatch(&warn, at(2_000 + tick * 5)).await;
+        }
+
+        dispatcher.dispatch(&[], at(2_045)).await;
+        assert_eq!(fake.levels(), [Level::Warn], "still inside the window");
+
+        dispatcher.dispatch(&[], at(2_080)).await;
+        assert_eq!(fake.levels(), [Level::Warn, Level::Recovered]);
+    }
+
+    /// Severity seen while waiting is not lost: if it is already critical by the
+    /// time the window elapses, the first message says so.
+    #[tokio::test]
+    async fn a_condition_that_worsens_before_confirming_fires_at_its_worst() {
+        let fake = Fake::shared();
+        let mut dispatcher = damped(fake.clone());
+
+        dispatcher
+            .dispatch(&[silent("product-scraper", Severity::Warn, 312)], at(2_000))
+            .await;
+        dispatcher
+            .dispatch(
+                &[silent("product-scraper", Severity::Critical, 950)],
+                at(2_010),
+            )
+            .await;
+        dispatcher
+            .dispatch(
+                &[silent("product-scraper", Severity::Critical, 950)],
+                at(2_040),
+            )
+            .await;
+
+        assert_eq!(
+            fake.levels(),
+            [Level::Critical],
+            "one message, at the severity it had reached"
+        );
+    }
+
+    #[tokio::test]
+    async fn damping_is_per_condition_not_per_subject() {
+        let fake = Fake::shared();
+        let mut dispatcher = damped(fake.clone());
+
+        let heartbeat = silent("vendor-api", Severity::Warn, 312);
+        let slow = degraded(
+            Severity::Warn,
+            1_400,
+            Baseline::Ready {
+                p90: Duration::from_millis(140),
+                samples: 118,
+            },
+            Trigger::Ceiling,
+        );
+
+        // The heartbeat holds; the latency blinks.
+        dispatcher
+            .dispatch(&[heartbeat.clone(), slow], at(2_000))
+            .await;
+        dispatcher
+            .dispatch(std::slice::from_ref(&heartbeat), at(2_040))
+            .await;
+
+        assert_eq!(
+            fake.levels(),
+            [Level::Warn],
+            "only the condition that held should have fired"
+        );
+        assert_eq!(dispatcher.open_incidents(), 1);
     }
 
     // -- delivery failures -------------------------------------------------

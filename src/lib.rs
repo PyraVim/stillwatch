@@ -6,6 +6,7 @@
 pub mod config;
 pub mod evaluate;
 pub mod fmt;
+pub mod incidents;
 pub mod learn;
 pub mod notify;
 pub mod passive;
