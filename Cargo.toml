@@ -1,6 +1,6 @@
 [package]
 name = "stillwatch"
-version = "0.6.1"
+version = "0.6.2"
 edition = "2021"
 # Verified in CI, not guessed. The crate itself builds on less, but `url` pulls
 # in the icu crates and those need 1.88.
