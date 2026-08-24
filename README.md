@@ -345,6 +345,9 @@ Distinctions the tool keeps, because each sends you somewhere different:
   and stopped moving means a stuck job.
 * A pidfile absent since stillwatch started might be a dead job, or one not
   started yet. The alert says both rather than guessing.
+* A pidfile holding something that isn't a process id reads as an unreadable
+  file, not a dead job. A half-written pidfile is a problem with the file, and
+  reporting an outage would send you to the wrong machine.
 * An artifact that is fresh but nearly empty is reported as empty rather than
   stale. Its age is beside the point; that's the run that exited zero and wrote
   nothing.
@@ -657,8 +660,13 @@ cargo build --release
 ./target/release/stillwatch --config stillwatch.toml
 ```
 
-One binary and no database. It links libc and a TLS stack; there's nothing else
-to install.
+Building needs a C compiler on the machine, because rustls's crypto backend
+(`aws-lc-sys`) compiles C. It doesn't need cmake, which is why
+[`deploy/Dockerfile`](deploy/Dockerfile) builds on `rust:1.96-slim-bookworm` and
+installs no extra packages.
+
+Running it needs none of that. One binary and no database. It links libc and a
+TLS stack; there's nothing else to install.
 
 **systemd** — [`deploy/stillwatch.service`](deploy/stillwatch.service).
 `KillSignal=SIGINT` is load-bearing: that's what stillwatch shuts down gracefully

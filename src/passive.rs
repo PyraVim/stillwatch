@@ -275,6 +275,18 @@ fn read_pidfile(path: &Path) -> ProcessFinding {
         ));
     };
 
+    // 0 and anything past `pid_t` parse as u32 but are not process ids. They
+    // come from a truncated or half-written pidfile, and calling either one an
+    // outage would blame the job for what is really an unreadable file.
+    //
+    // On Unix they are worse than meaningless: `kill` reads 0 as the caller's
+    // own process group, and a value that overflows `pid_t` arrives as a
+    // negative pid, which is a broadcast. Both answer "running" for a file that
+    // says no such thing.
+    if pid == 0 || pid > i32::MAX as u32 {
+        return ProcessFinding::PidfileUnreadable(format!("not a process id: {pid}"));
+    }
+
     if is_running(pid) {
         ProcessFinding::Running { pid }
     } else {
@@ -290,10 +302,23 @@ fn read_pidfile(path: &Path) -> ProcessFinding {
 /// than the alert implying more certainty than there is.
 #[cfg(unix)]
 fn is_running(pid: u32) -> bool {
+    // `kill` reads a pid of 0 as "every process in the caller's own process
+    // group" and a negative pid as a process group or a broadcast, so both
+    // succeed for as long as stillwatch itself is alive. Unguarded, either
+    // reports the watched job healthy on the strength of the watchdog being
+    // healthy. Windows has no such aliasing, which is why this only ever failed
+    // on Unix.
+    if pid == 0 {
+        return false;
+    }
+    let Ok(pid) = libc::pid_t::try_from(pid) else {
+        return false;
+    };
+
     // Signal 0 performs the permission and existence checks without sending
     // anything. `EPERM` means the process exists and is not ours, which still
     // answers the question being asked.
-    let result = unsafe { libc::kill(pid as libc::pid_t, 0) };
+    let result = unsafe { libc::kill(pid, 0) };
     if result == 0 {
         return true;
     }
@@ -585,7 +610,29 @@ mod tests {
     #[test]
     fn this_process_is_running_and_a_reserved_id_is_not() {
         assert!(is_running(std::process::id()));
-        // Process id 0 is never a real user process on either platform.
         assert!(!is_running(0));
+    }
+
+    /// A pidfile of `0` used to report the job *running*, because on Unix
+    /// `kill(0, 0)` asks about the caller's own process group and therefore
+    /// always succeeds. A watchdog answering "your job is fine" on the strength
+    /// of its own process existing is the exact failure this tool is against, so
+    /// it gets a test with its name on it.
+    #[test]
+    fn a_pidfile_of_zero_is_corrupt_rather_than_a_healthy_process() {
+        let dir = tempfile::tempdir().expect("tempdir");
+
+        // 0 is the caller's process group; anything past `pid_t` arrives as a
+        // negative pid, which is a broadcast. Both used to answer "running".
+        for corrupt in ["0\n", "4294967295\n"] {
+            let path = dir.path().join("corrupt.pid");
+            write(&path, corrupt);
+
+            let finding = read_pidfile(&path);
+            assert!(
+                matches!(finding, ProcessFinding::PidfileUnreadable(_)),
+                "{corrupt:?} is not a process id: {finding:?}"
+            );
+        }
     }
 }

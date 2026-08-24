@@ -235,21 +235,46 @@ async fn a_fresh_but_empty_export_is_reported_as_empty() {
     assert!(text.contains("exits zero"), "{text}");
 }
 
+/// Runs a process to completion and returns its now-free pid.
+///
+/// Sentinel values do not work here: 0 and anything past `pid_t` are rejected as
+/// corrupt pidfiles, and picking a "probably unused" high number is a guess. A
+/// process that genuinely ran and exited is the real thing. The pid could in
+/// principle be handed to something else before the assertion runs, which is the
+/// same recycling limit the README documents.
+fn a_reaped_pid() -> u32 {
+    let mut child = if cfg!(windows) {
+        std::process::Command::new("cmd")
+            .args(["/C", "exit"])
+            .spawn()
+    } else {
+        std::process::Command::new("true").spawn()
+    }
+    .expect("spawn a short-lived process");
+
+    let pid = child.id();
+    child.wait().expect("wait for it to exit");
+    // Windows keeps the process object alive while a handle is open, and `Child`
+    // holds one until it is dropped.
+    drop(child);
+    pid
+}
+
 /// A pidfile naming a process that does not exist.
 #[tokio::test]
 async fn a_dead_pid_is_reported_and_names_the_pid() {
     let dir = tempfile::tempdir().expect("tempdir");
     let config = config_for(dir.path());
 
-    // Process id 0 is never a real user process on either platform.
-    write(&dir.path().join("etl.pid"), "0\n");
+    let pid = a_reaped_pid();
+    write(&dir.path().join("etl.pid"), &format!("{pid}\n"));
 
     let state = SharedState::new(State::new(at(START), &config.jobs, &config.checks));
     watcher(&config).poll(&state, at(START + 5));
 
     let text = texts(&state, START + 200)
         .into_iter()
-        .find(|t| t.contains("process 0 is gone"))
+        .find(|t| t.contains(&format!("process {pid} is gone")))
         .expect("a dead-process finding");
 
     assert!(text.contains("did not exit on purpose"), "{text}");
