@@ -1,8 +1,10 @@
 [package]
 name = "stillwatch"
-version = "0.6.0"
+version = "0.6.1"
 edition = "2021"
-rust-version = "1.85"
+# Verified in CI, not guessed. The crate itself builds on less, but `url` pulls
+# in the icu crates and those need 1.88.
+rust-version = "1.88"
 license = "MIT"
 description = "A watchdog for processes that run unattended."
 repository = "https://github.com/PyraVim/stillwatch"
