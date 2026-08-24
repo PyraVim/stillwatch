@@ -41,16 +41,26 @@ const POLL: Duration = Duration::from_secs(15);
 /// memory exhaustion.
 const MAX_SCAN_BYTES: u64 = 4 * 1024 * 1024;
 
-/// Watches one job's filesystem signals forever.
-pub async fn run(job: JobConfig, state: SharedState) {
-    let mut ticker = tokio::time::interval(POLL);
-    ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
+/// Watches one job's filesystem signals.
+///
+/// Holds the tail position between looks, which is the only state a passive
+/// watcher needs — and the reason this is a struct rather than a free function.
+pub struct Watcher {
+    job: JobConfig,
+    tail: Tail,
+}
 
-    let mut tail = Tail::default();
+impl Watcher {
+    pub fn new(job: JobConfig) -> Self {
+        Self {
+            job,
+            tail: Tail::default(),
+        }
+    }
 
-    loop {
-        ticker.tick().await;
-        let now = SystemTime::now();
+    /// Takes one look at everything this job is watched by.
+    pub fn poll(&mut self, state: &SharedState, now: SystemTime) {
+        let job = &self.job;
 
         if let Some(watch) = &job.process {
             let finding = read_pidfile(&watch.pidfile);
@@ -59,7 +69,7 @@ pub async fn run(job: JobConfig, state: SharedState) {
         }
 
         if let Some(watch) = &job.log {
-            let sample = tail.poll(&watch.path, watch.error_regex.as_ref());
+            let sample = self.tail.poll(&watch.path, watch.error_regex.as_ref());
             if sample.rotated {
                 tracing::info!(job = %job.name, path = %watch.path.display(), "log rotated");
             }
@@ -70,6 +80,18 @@ pub async fn run(job: JobConfig, state: SharedState) {
             let finding = look(&watch.path);
             state.record_artifact(&job.name, finding);
         }
+    }
+}
+
+/// Watches one job's filesystem signals forever.
+pub async fn run(job: JobConfig, state: SharedState) {
+    let mut ticker = tokio::time::interval(POLL);
+    ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    let mut watcher = Watcher::new(job);
+
+    loop {
+        ticker.tick().await;
+        watcher.poll(&state, SystemTime::now());
     }
 }
 
