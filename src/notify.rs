@@ -1071,7 +1071,9 @@ impl Dispatcher {
 
             // Confirmed. The incident is dated from when the condition began,
             // not from now, so its eventual duration covers the whole thing.
-            let pending = self.pending.remove(&key).expect("just looked it up");
+            let Some(pending) = self.pending.remove(&key) else {
+                continue;
+            };
             let notification = render(&pending.latest, now);
 
             self.record(crate::incidents::opened(
